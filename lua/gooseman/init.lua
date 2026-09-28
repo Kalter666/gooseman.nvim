@@ -705,7 +705,7 @@ local function send_terminal(lines, b, path)
   if vim.fn.executable(cmd[1]) == 0 then
     return vim.notify("gooseman: " .. cmd[1] .. " not installed", vim.log.levels.ERROR)
   end
-  vim.cmd "botright split"
+  vim.cmd "botright new" -- jobstart{term} takes over the current buffer: give it an empty one
   local job = vim.fn.jobstart(cmd, { term = true })
   if stdin then
     vim.fn.chansend(job, stdin .. "\n")

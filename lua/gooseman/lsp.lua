@@ -202,7 +202,9 @@ local function has_file_header(s, header)
   end
 end
 
-local function snippet_items(s, row)
+-- `pos`: the cursor; snippets replace the whole line up to it, since prefixes like
+-- `post-json` aren't one keyword and clients would otherwise filter on `json` alone
+local function snippet_items(s, row, pos)
   local out = {}
   for _, sn in ipairs(snippets.list) do
     local body = sn.body
@@ -222,7 +224,7 @@ local function snippet_items(s, row)
         item.additionalTextEdits = { { range = { start = top, ["end"] = top }, newText = line } }
       end
     end
-    item.insertText = snippets.lsp_body(body)
+    item.textEdit = { range = { start = { line = row - 1, character = 0 }, ["end"] = pos }, newText = snippets.lsp_body(body) }
     out[#out + 1] = item
   end
   return out
@@ -304,10 +306,10 @@ local function complete(params)
     return out
   end
   if r == "request" and before:match "^%u*$" then
-    return vim.list_extend(items(vim.tbl_keys(g.METHODS), K.Keyword), snippet_items(s, row))
+    return vim.list_extend(items(vim.tbl_keys(g.METHODS), K.Keyword), snippet_items(s, row, params.position))
   end
   if r ~= "header" and before:match "^%a[%w%-]*$" then
-    return snippet_items(s, row)
+    return snippet_items(s, row, params.position)
   end
   if r == "header" then
     local hname = before:match "^%s*([%w%-]+):%s*[^{]*$"
@@ -500,7 +502,7 @@ local function definition(params)
     for i, l in ipairs(vim.fn.readfile(file)) do
       if l:find('"' .. r.ref .. '"', 1, true) then
         local pos = { line = i - 1, character = 0 }
-        return { uri = vim.uri_from_fname(file), range = { start = pos, ["end"] = pos } }
+        return { { uri = vim.uri_from_fname(file), range = { start = pos, ["end"] = pos } } }
       end
     end
   end
@@ -508,10 +510,11 @@ local function definition(params)
   if not line then
     return nil
   end
-  return {
+  -- a list, not a bare Location: tagfunc (Ctrl-]) only takes lists
+  return { {
     uri = params.textDocument.uri,
     range = { start = { line = line - 1, character = 0 }, ["end"] = { line = line - 1, character = 0 } },
-  }
+  } }
 end
 
 function M.diagnostics(lines, uri)
@@ -788,7 +791,11 @@ local function server(dispatchers)
       id = id + 1
       local h = handlers[method]
       local ok, res = pcall(h or function() end, params)
-      callback(nil, ok and res or nil)
+      -- answer on the next tick like a real server: clients (native completion's omnifunc)
+      -- may be under textlock while the request is made
+      vim.schedule(function()
+        callback(nil, ok and res or nil)
+      end)
       return true, id
     end,
     notify = function(method, params)
