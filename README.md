@@ -12,6 +12,8 @@
 
 </div>
 
+![gooseman: send requests, reuse a login token, run the file as a test](demo/hero.gif)
+
 ---
 
 Write requests in a `.http` file, put the cursor inside one, run `:Honk`.
@@ -77,6 +79,9 @@ Statusline: `require("gooseman").statusline()` returns `🪿 dev` while an envir
 
 ## 🪟 The response window
 
+![response window: folded headers, yr copies a reference, raw view, binary body, save](demo/response.gif)
+
+
 - The status line turns green or red depending on your `@expect`s.
 - Under it, where the time went: `dns 2 · connect 3 · tls 25 · server 40 · download 5  = 75 ms` (HTTP only).
 - Headers fold closed under their `HTTP/1.1 200 OK` line: `zo` opens them, `zc` closes them.
@@ -85,6 +90,10 @@ Statusline: `require("gooseman").statusline()` returns `🪿 dev` while an envir
 - **`yr` copies a reference to the value under the cursor**, e.g. `{{goose.body.items.0.id}}`, ready to paste into
   the next request. If the request has no name yet, gooseman asks for one, adds `# @name` to it and caches the
   response, so the reference works right away.
+- **History and diff:** `:Honk history` brings back any of the last 50 responses. `:Honk diff` compares the
+  response on screen with the previous one of the same request.
+
+  ![history and diff](demo/diff.gif)
 - **Binary bodies** (images, PDFs, archives) show as `<binary body: 12.3 KB, image/png>` instead of garbage.
   Press `o` to save the exact bytes and open them in your system viewer.
 
@@ -273,6 +282,9 @@ Authorization: Bearer someone-else
 
 ## 🌍 Environments
 
+![switching environments; prod asks before sending](demo/env.gif)
+
+
 Put a `gooseman.json` next to your `.http` files (or in any parent directory):
 
 ```json
@@ -299,6 +311,9 @@ and the LSP hover masks its values. Environment values can use `{{refs}}` and `$
 An `@var` in the file wins over the environment.
 
 ## ✅ Asserts & smoke tests
+
+![asserts, @each rows, :Honk all with quickfix, and a headless CI run](demo/tests.gif)
+
 
 ```http
 ### login
@@ -339,6 +354,9 @@ prod-named one) asks before sending, so use an unguarded one in CI.
 
 ## 📋 curl in and out
 
+![copy a request as curl, import a curl command](demo/curl.gif)
+
+
 - **`:Honk curl`** copies the request under the cursor as a ready-to-share command: curl, grpcurl, or websocat.
   Variables are already filled in.
 - **`:Honk import`** turns a curl command (from devtools **Copy as cURL**, docs, Slack…) into a `.http` block:
@@ -346,6 +364,14 @@ prod-named one) asks before sending, so use an unguarded one in CI.
   - `-d`/`--data-raw` becomes the body
   - `-L`, `-k`, `--compressed` and other flags go into `# @args`
   - It handles `'…'`, `"…"`, `$'…'` quoting and `\` line continuations.
+
+## 📥 OpenAPI import
+
+`:Honk openapi <file or url>` turns an OpenAPI 3 or Swagger 2 spec into a `.http` buffer: one request per
+operation, path and required query/header parameters as `{{variables}}`, and JSON bodies filled from the
+schema's examples. JSON specs work out of the box; YAML needs `yq`.
+
+![OpenAPI import](demo/openapi.gif)
 
 ## ✂️ Snippets
 
@@ -376,6 +402,9 @@ already has an `Authorization` header there.
 
 ## 🧠 Built-in LSP
 
+![completion from a cached response, hover, go to definition, diagnostics, code action, snippet](demo/lsp.gif)
+
+
 Opening a `.http` file starts a tiny language server inside Neovim. There's no binary and nothing to configure,
 and your usual LSP keymaps and completion plugin (blink.cmp, nvim-cmp) pick it up.
 
@@ -389,6 +418,9 @@ and your usual LSP keymaps and completion plugin (blink.cmp, nvim-cmp) pick it u
 
 ## 🛰️ gRPC
 
+![gRPC: list services, complete a method, fill the body template, call](demo/grpc.gif)
+
+
 - `GRPC host:port` lists services (uses server reflection).
 - `GRPC host:port pkg.Service` lists that service's methods.
 - `GRPC host:port pkg.Service/Method` calls it. The body is the JSON request (empty body sends `{}`).
@@ -400,10 +432,13 @@ and your usual LSP keymaps and completion plugin (blink.cmp, nvim-cmp) pick it u
   The template code action does a full expansion and runs the login itself if it needs to.
 - No reflection on the server? Use `# @args -import-path ./proto -proto service.proto`.
 
-## 🔌 WebSocket
+## 🔌 WebSocket & streaming
 
 `WS` opens a terminal split running websocat. Body lines are sent as the first messages
 right after connecting. After that, type a line and press Enter to send it, and Ctrl-C hangs up.
+Requests marked `# @stream` (or sending `Accept: text/event-stream`) stream into a terminal the same way.
+
+![WebSocket and Server-Sent Events](demo/stream.gif)
 
 ## 🧪 Playground
 
@@ -422,6 +457,9 @@ Then open [`examples/`](examples) and honk away:
 [`tests.http`](examples/tests.http) (`:Honk all`)
 
 Parser tests: `nvim -l tests/parse.lua`
+
+The GIFs in this README are recorded with [vhs](https://github.com/charmbracelet/vhs) from the scripts in
+[`demo/`](demo): `vhs demo/hero.tape` (needs the tools above plus `go`).
 
 ## 📄 License
 

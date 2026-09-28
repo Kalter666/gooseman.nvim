@@ -1,0 +1,7 @@
+@host = http://localhost:8080
+
+### feed the goose
+POST {{host}}/geese/honk/feed
+Content-Type: application/json
+
+{"food": "bread", "amount": 1}

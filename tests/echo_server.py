@@ -14,6 +14,7 @@ Auth-protected routes (401 when credentials are wrong):
   /oauth/token   POST form grant_type=client_credentials, client "cli" / "cli-secret"
                  (form fields or Basic auth) -> {"access_token": ...}
   /image         a 1x1 PNG (binary body)
+  /events        Server-Sent Events: one "honk" per 0.7s, ?n= of them (default 5)
   /missing/...   always 404
 """
 import base64
@@ -86,6 +87,17 @@ class Echo(BaseHTTPRequestHandler):
             png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", (1).to_bytes(4, "big") * 2 + b"\x08\x02\x00\x00\x00")
                    + chunk(b"IDAT", zlib.compress(b"\x00\xff\x88\x00")) + chunk(b"IEND", b""))
             return self.reply(200, png, ctype="image/png")
+
+        if url.path == "/events":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            for i in range(int(query.get("n", ["5"])[0])):
+                self.wfile.write(f'id: {i}\ndata: {{"honk": {i}, "at": "{time.strftime("%H:%M:%S")}"}}\n\n'.encode())
+                self.wfile.flush()
+                time.sleep(0.7)
+            return
 
         if url.path == "/jwt":
             ttl = int(query.get("ttl", ["3600"])[0])

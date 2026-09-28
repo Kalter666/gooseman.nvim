@@ -1,0 +1,31 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "Goose Store" },
+  "servers": [{ "url": "http://localhost:8080/v1" }],
+  "paths": {
+    "/geese": {
+      "get": { "summary": "list geese", "parameters": [{ "name": "limit", "in": "query", "required": true }] },
+      "post": {
+        "summary": "adopt a goose",
+        "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Goose" } } } }
+      }
+    },
+    "/geese/{id}": {
+      "parameters": [{ "name": "id", "in": "path", "required": true }],
+      "get": { "summary": "one goose" },
+      "delete": { "summary": "release a goose" }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Goose": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "example": "honk" },
+          "mood": { "type": "string", "enum": ["chaotic", "calm"] },
+          "born": { "type": "string", "format": "date" }
+        }
+      }
+    }
+  }
+}

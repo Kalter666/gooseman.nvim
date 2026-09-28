@@ -1,0 +1,10 @@
+@host = http://localhost:8080
+
+### create a goose
+POST {{host}}/geese
+Content-Type: application/json
+
+{"name": "honk", "tags": ["loud", "chaotic"], "age": 5}
+
+### binary bodies stay intact
+GET {{host}}/image

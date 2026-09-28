@@ -1,0 +1,22 @@
+@host = http://localhost:8080
+
+### log in
+# @name login
+# @expect status == 200
+# @expect body.token matches ^login%-%d+$
+POST {{host}}/login
+Content-Type: application/json
+
+{"user": "gooseman", "password": "secret"}
+
+### one request per row of geese.csv
+# @each geese.csv
+# @expect body.body.age >= 3
+POST {{host}}/geese/{{goose}}
+Content-Type: application/json
+
+{"age": {{age}}}
+
+### this one fails
+# @expect status == 200
+GET {{host}}/missing/goose

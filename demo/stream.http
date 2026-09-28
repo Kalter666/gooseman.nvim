@@ -1,0 +1,8 @@
+### WebSocket: the body is sent on connect, then type messages
+WS ws://localhost:9000
+
+{"hello": "goose"}
+
+### Server-Sent Events stream in live
+GET http://localhost:8080/events?n=6
+Accept: text/event-stream

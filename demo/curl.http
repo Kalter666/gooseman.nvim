@@ -1,0 +1,8 @@
+@host = http://localhost:8080
+
+### create a goose
+POST {{host}}/geese
+Content-Type: application/json
+X-Goose: honk
+
+{"name": "honk"}

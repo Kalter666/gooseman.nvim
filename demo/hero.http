@@ -1,0 +1,21 @@
+@host = http://localhost:8080
+# @header Authorization: Bearer {{login.body.token}}
+
+### log in
+# @name login
+# @expect status == 200
+POST {{host}}/login
+Content-Type: application/json
+
+{"user": "gooseman", "password": "secret"}
+
+### the token is reused automatically
+# @expect status == 200
+GET {{host}}/bearer
+
+### create a goose
+# @expect body.body.name == honk
+POST {{host}}/geese
+Content-Type: application/json
+
+{"name": "honk", "tags": ["loud", "chaotic"], "age": 5}

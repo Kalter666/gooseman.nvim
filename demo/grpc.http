@@ -1,0 +1,8 @@
+@grpc = grpc://localhost:50051
+# @header authorization: Bearer static-token
+
+### what does the server have?
+GRPC {{grpc}}
+
+### health check
+GRPC {{grpc}} 
