@@ -8,7 +8,12 @@
 --                   {{login.status}}. Runs on first use, then cached for the session.
 --   # @args ...     raw flags for the tool (mTLS, -proto, -k, cookie jars, ...)
 --   # @header K: V  (before the first ###) header added to every request in the file
+--   # @expect ...   assertion on the response (see expect.lua); `:Honk all` runs the file as a test
 -- Before the first ###, @args also applies to every request.
+-- Environments (gooseman.json) supply variables too, see env.lua.
+
+local env = require "gooseman.env"
+local expect = require "gooseman.expect"
 
 local M = {}
 
@@ -48,7 +53,8 @@ function M.scan(lines)
   end
 
   for _, b in ipairs(ranges) do
-    b.args, b.headers, b.body = {}, {}, {}
+    b.args, b.headers, b.body, b.expects = {}, {}, {}, {}
+    b.title = b.sep and lines[b.sep]:match "^###%s*(.-)%s*$" or ""
     local state = "pre"
     for i = b.first, b.last do
       local l = lines[i]
@@ -67,6 +73,8 @@ function M.scan(lines)
           s.names[dv] = b
         elseif d == "args" then
           table.insert(b.preamble and s.file_args or b.args, { text = dv, line = i })
+        elseif d == "expect" then
+          table.insert(b.expects, { text = dv, line = i })
         elseif d == "header" and b.preamble then
           table.insert(s.file_headers, { text = dv, line = i })
         elseif is_comment(l) then
@@ -175,6 +183,7 @@ local expand
 -- Response of a named request: cached, or run it now (synchronously) and cache it.
 local function response_for(ctx, name, depth)
   if M.responses[name] then
+    ctx.from_cache[name] = true
     return M.responses[name]
   end
   local b = ctx.s.names[name]
@@ -192,7 +201,9 @@ local function response_for(ctx, name, depth)
   local r = vim.system(cmd, { stdin = stdin, text = true }):wait()
   local resp = M.to_response(req.method, r.stdout)
   if r.code ~= 0 or resp.status >= 400 then
-    error(("dependency `%s` failed (exit %d, status %d): %s"):format(name, r.code, resp.status, vim.trim(r.stderr)), 0)
+    local why = vim.trim(r.stderr) ~= "" and vim.trim(r.stderr)
+      or (type(resp.body) == "table" and vim.json.encode(resp.body) or vim.trim(tostring(resp.body)))
+    error(("dependency `%s` failed (exit %d, status %d): %s"):format(name, r.code, resp.status, why:sub(1, 200)), 0)
   end
   M.responses[name] = resp
   return resp
@@ -202,7 +213,7 @@ local function lookup(ctx, key, depth)
   if ctx.resolved[key] then
     return ctx.resolved[key]
   end
-  local var = ctx.s.vars[key]
+  local var = ctx.s.vars[key] or ctx.env[key]
   if var then
     local v = expand(var.value, ctx, depth + 1)
     local sh = v:match "^%$%((.*)%)$"
@@ -243,8 +254,13 @@ function expand(str, ctx, depth)
   end))
 end
 
-function M.context(lines)
-  return { lines = lines, s = M.scan(lines), resolved = {}, running = {} }
+--- Expansion state for one send. `path` locates gooseman.json (defaults to cwd).
+function M.context(lines, path)
+  return { lines = lines, s = M.scan(lines), env = env.vars(path), resolved = {}, running = {}, from_cache = {} }
+end
+
+function M.expand(str, ctx)
+  return expand(str, ctx, 0)
 end
 
 -- ponytail: whitespace split, no shell quoting; paths with spaces need a var without spaces
@@ -304,8 +320,8 @@ function M.build(ctx, b, depth)
 end
 
 --- Parse + expand the block containing `row` (1-based).
-function M.parse(lines, row)
-  local ctx = M.context(lines)
+function M.parse(lines, row, path)
+  local ctx = M.context(lines, path)
   local b = M.block_at(ctx.s, row)
   if not (b and b.req) then
     return nil, "no request under cursor"
@@ -392,26 +408,109 @@ local function format_http(out)
   return head .. "\n" .. body
 end
 
+M.REFRESH_COOLDOWN = 60
+local refreshed_at = {} -- named request -> os.time() of its last auto-refresh
+
+local function errmsg(e)
+  return type(e) == "table" and ("request `%s` depends on itself"):format(e.cycle) or tostring(e)
+end
+
+--- Build and run one block asynchronously; `cb(res)` gets
+--- {req, r, resp, ms, retried, checks} or {err}.
+--- A 401 on a request that used cached named responses (a login token, say)
+--- forgets those, re-runs them and retries once. To go easy on rate limits:
+--- 401 only (403 means forbidden, a fresh token won't help), each named request is
+--- refreshed at most once per REFRESH_COOLDOWN seconds, and
+--- `vim.g.gooseman_auto_refresh = false` turns it off.
+function M.run(lines, b, path, cb)
+  local function attempt(retried)
+    local ctx = M.context(lines, path)
+    local ok, req = pcall(M.build, ctx, b)
+    if not ok then
+      return cb { err = errmsg(req) }
+    end
+    local cmd, stdin = M.command(req)
+    if vim.fn.executable(cmd[1]) == 0 then
+      return cb { err = cmd[1] .. " not installed" }
+    end
+    local start = vim.uv.hrtime()
+    vim.system(cmd, { stdin = stdin, text = true }, vim.schedule_wrap(function(r)
+      local resp = M.to_response(req.method, r.stdout)
+      local stale = not retried and resp.status == 401 and vim.g.gooseman_auto_refresh ~= false
+        and vim.tbl_filter(function(name)
+          return os.time() - (refreshed_at[name] or 0) >= M.REFRESH_COOLDOWN
+        end, vim.tbl_keys(ctx.from_cache))
+      if stale and #stale > 0 then
+        for _, name in ipairs(stale) do
+          M.responses[name], refreshed_at[name] = nil, os.time()
+        end
+        return attempt(stale)
+      end
+      if req.name and r.code == 0 then
+        M.responses[req.name] = resp
+      end
+      local checks = expect.check(b.expects, resp, r.code, M.field, function(v)
+        return M.expand(v, ctx)
+      end)
+      cb {
+        req = req, r = r, resp = resp, retried = retried, checks = checks,
+        ms = math.floor((vim.uv.hrtime() - start) / 1e6),
+      }
+    end))
+  end
+  attempt(false)
+end
+
+local function title_of(req)
+  return vim.trim(("%s %s %s"):format(req.method, req.url, req.target or ""))
+end
+
+local function render(res)
+  local out = {
+    ("%s  (%dms, exit %d%s)"):format(
+      title_of(res.req), res.ms, res.r.code,
+      res.retried and (", retried after refreshing " .. table.concat(res.retried, ", ")) or ""
+    ),
+  }
+  for _, c in ipairs(res.checks) do
+    if c.text ~= "succeeds" then -- the default check is implied by the status line
+      out[#out + 1] = (c.ok and "  ✓ " or "  ✗ ") .. c.text .. (c.ok and "" or ("   (got " .. tostring(c.got) .. ")"))
+    end
+  end
+  out[#out + 1] = ""
+  local text = res.r.stdout .. (res.r.stderr ~= "" and ("\n" .. res.r.stderr) or "")
+  if res.req.method ~= "GRPC" then
+    text = format_http(text)
+  end
+  return vim.list_extend(out, vim.split(text, "\n"))
+end
+
+local function current()
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local b = M.block_at(M.scan(lines), row)
+  return lines, b, vim.api.nvim_buf_get_name(0), row
+end
+
 ---@param opts? {fresh:boolean} fresh: forget cached named responses first
 function M.send(opts)
   if opts and opts.fresh then
     M.responses = {}
   end
-  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-  local ok, req, err = pcall(M.parse, lines, vim.api.nvim_win_get_cursor(0)[1])
-  if not ok then
-    err = type(req) == "table" and ("request `%s` depends on itself"):format(req.cycle) or req
-    req = nil
-  end
-  if not req then
-    return vim.notify("gooseman: " .. tostring(err), vim.log.levels.WARN)
-  end
-  local cmd, stdin = M.command(req)
-  if vim.fn.executable(cmd[1]) == 0 then
-    return vim.notify("gooseman: " .. cmd[1] .. " not installed", vim.log.levels.ERROR)
+  local lines, b, path = current()
+  if not (b and b.req) then
+    return vim.notify("gooseman: no request under cursor", vim.log.levels.WARN)
   end
 
-  if req.method == "WS" then
+  if b.req.text:match "^WS%s" then
+    local ok, req = pcall(M.build, M.context(lines, path), b)
+    if not ok then
+      return vim.notify("gooseman: " .. errmsg(req), vim.log.levels.WARN)
+    end
+    local cmd, stdin = M.command(req)
+    if vim.fn.executable(cmd[1]) == 0 then
+      return vim.notify("gooseman: websocat not installed", vim.log.levels.ERROR)
+    end
     vim.cmd "botright split"
     local job = vim.fn.jobstart(cmd, { term = true })
     if stdin then
@@ -420,22 +519,114 @@ function M.send(opts)
     return vim.cmd "startinsert"
   end
 
-  local title = ("%s %s %s"):format(req.method, req.url, req.target or "")
-  show { title .. "  …" }
-  local start = vim.uv.hrtime()
-  vim.system(cmd, { stdin = stdin, text = true }, function(r)
-    vim.schedule(function()
-      local ms = math.floor((vim.uv.hrtime() - start) / 1e6)
-      if req.name and r.code == 0 then
-        M.responses[req.name] = M.to_response(req.method, r.stdout)
-      end
-      local out = r.stdout .. (r.stderr ~= "" and ("\n" .. r.stderr) or "")
-      if req.method ~= "GRPC" then
-        out = format_http(out)
-      end
-      show(vim.list_extend({ ("%s  (%dms, exit %d)"):format(title, ms, r.code), "" }, vim.split(out, "\n")))
-    end)
+  show { b.req.text .. "  …" }
+  M.run(lines, b, path, function(res)
+    if res.err then
+      show { "gooseman: " .. res.err }
+      return vim.notify("gooseman: " .. res.err, vim.log.levels.WARN)
+    end
+    show(render(res))
   end)
+end
+
+--- Run every HTTP/gRPC request in the buffer top to bottom (WS skipped); report + quickfix.
+function M.send_all(opts)
+  if opts and opts.fresh then
+    M.responses = {}
+  end
+  local lines, _, path = current()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local blocks = vim.tbl_filter(function(b)
+    return b.req and not b.req.text:match "^WS%s"
+  end, M.scan(lines).blocks)
+  local report, qf, failed, i = {}, {}, 0, 0
+  local started = vim.uv.hrtime()
+
+  local function finish()
+    local ms = math.floor((vim.uv.hrtime() - started) / 1e6)
+    local head = ("honk all: %d passed, %d failed  (%dms%s)"):format(
+      #blocks - failed, failed, ms, env.active and (", env " .. env.active) or ""
+    )
+    show(vim.list_extend({ head, "" }, report))
+    vim.fn.setqflist({}, "r", { title = "gooseman", items = qf })
+    vim.notify("gooseman: " .. head, failed > 0 and vim.log.levels.WARN or vim.log.levels.INFO)
+  end
+
+  local function step()
+    i = i + 1
+    local b = blocks[i]
+    if not b then
+      return finish()
+    end
+    show { ("honk all: %d/%d  %s"):format(i, #blocks, b.req.text) }
+    M.run(lines, b, path, function(res)
+      local name = b.title ~= "" and b.title or b.req.text
+      local bad = {}
+      if res.err then
+        bad[1] = res.err
+      else
+        for _, c in ipairs(res.checks) do
+          if not c.ok then
+            bad[#bad + 1] = c.text .. "   (got " .. tostring(c.got) .. ")"
+          end
+        end
+      end
+      local status = res.resp and (res.req.method == "GRPC" and ("exit " .. res.r.code) or res.resp.status) or "-"
+      report[#report + 1] = ("%s %s   %s  %s"):format(#bad == 0 and "✓" or "✗", name, status, res.ms and (res.ms .. "ms") or "")
+      for _, m in ipairs(bad) do
+        report[#report + 1] = "    " .. m
+        qf[#qf + 1] = { bufnr = bufnr, lnum = b.req.line, text = name .. ": " .. m }
+      end
+      if #bad > 0 then
+        failed = failed + 1
+      end
+      step()
+    end)
+  end
+  step()
+end
+
+--- Copy the request under the cursor as a shell command.
+function M.copy_curl()
+  local lines, b, path = current()
+  if not (b and b.req) then
+    return vim.notify("gooseman: no request under cursor", vim.log.levels.WARN)
+  end
+  local ok, req = pcall(M.build, M.context(lines, path), b)
+  if not ok then
+    return vim.notify("gooseman: " .. errmsg(req), vim.log.levels.WARN)
+  end
+  local line = require("gooseman.curl").export(M.command(req))
+  vim.fn.setreg("+", line)
+  vim.fn.setreg('"', line)
+  vim.notify("gooseman: copied " .. line:sub(1, 80) .. (#line > 80 and "…" or ""))
+end
+
+--- Turn a curl command into a .http block: from the given line range (replaced),
+--- else from the clipboard (inserted after the current block).
+function M.import_curl(line1, line2)
+  local text = line1 and table.concat(vim.api.nvim_buf_get_lines(0, line1 - 1, line2, false), "\n")
+    or vim.fn.getreg "+"
+  if text == "" then
+    text = vim.fn.getreg '"'
+  end
+  local ok, block = pcall(require("gooseman.curl").to_http, text)
+  if not ok then
+    return vim.notify("gooseman: " .. block, vim.log.levels.WARN)
+  end
+  if line1 then
+    return vim.api.nvim_buf_set_lines(0, line1 - 1, line2, false, block)
+  end
+  local _, b, _, row = current()
+  local at = b and b.last or row
+  table.insert(block, 1, "")
+  vim.api.nvim_buf_set_lines(0, at, at, false, block)
+  vim.api.nvim_win_set_cursor(0, { at + 2, 0 })
+end
+
+--- For statuslines: "🪿 dev" when an environment is active.
+function M.statusline()
+  return env.active and ("🪿 " .. env.active) or ""
 end
 
 return M

@@ -1,10 +1,12 @@
 -- In-process language server for .http files: no binary, runs inside nvim.
 --   completion   {{vars}}, {{named.body.fields}}, methods, headers, header values, # @directives
---   hover        what a {{ref}} resolves to (shell vars are shown, not run)
---   definition   {{ref}} -> its @var line or `# @name` line
---   diagnostics  undefined refs, unknown methods/directives, duplicate names
+--   hover        what a {{ref}} resolves to (shell vars are shown, not run; secrets masked)
+--   definition   {{ref}} -> its @var line, `# @name` line or gooseman.json entry
+--   diagnostics  undefined refs, unknown methods/directives, bad @expect, duplicate names
 
 local g = require "gooseman"
+local env = require "gooseman.env"
+local expect = require "gooseman.expect"
 
 local M = {}
 
@@ -26,6 +28,7 @@ local DIRECTIVES = {
   name = "name this request; reuse its response as {{name.body.x}}",
   args = "raw flags for curl/grpcurl/websocat",
   header = "(before the first ###) header added to every request",
+  expect = "assert on the response: <path> <op> [value], e.g. status == 200",
 }
 
 local K = vim.lsp.protocol.CompletionItemKind
@@ -33,6 +36,15 @@ local K = vim.lsp.protocol.CompletionItemKind
 local function buf_lines(uri)
   local bufnr = vim.uri_to_bufnr(uri)
   return vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), bufnr
+end
+
+-- scan + the active environment's variables (a broken gooseman.json just means none)
+-- ponytail: re-reads gooseman.json on every request; cache by mtime if it ever shows up in a profile
+local function scan(lines, uri)
+  local s = g.scan(lines)
+  local ok, vars = pcall(env.vars, uri and vim.uri_to_fname(uri))
+  s.env = ok and vars or {}
+  return s
 end
 
 -- Role of a 1-based row: "request" | "header" | "body" | "other".
@@ -59,6 +71,9 @@ end
 local function kind_of(s, key)
   if s.vars[key] then
     return "var"
+  end
+  if s.env[key] then
+    return "envfile"
   end
   local name = key:match "^([^.]+)%."
   if name and (s.names[name] or g.responses[name]) then
@@ -122,7 +137,7 @@ local function complete(params)
   local row, col = params.position.line + 1, params.position.character
   local line = lines[row] or ""
   local before = line:sub(1, col)
-  local s = g.scan(lines)
+  local s = scan(lines, params.textDocument.uri)
 
   local ref = before:match "{{%s*([%w_%-%.]*)$"
   if ref then
@@ -135,6 +150,11 @@ local function complete(params)
     for k, v in pairs(s.vars) do
       out[#out + 1] = { label = k, kind = K.Variable, detail = v.value }
     end
+    for k, v in pairs(s.env) do
+      if not s.vars[k] then
+        out[#out + 1] = { label = k, kind = K.Constant, detail = "env " .. (env.active or "$shared") .. (v.private and " (private)" or "") }
+      end
+    end
     for k in pairs(s.names) do
       out[#out + 1] = { label = k, kind = K.Module, detail = "response of ### " .. k }
     end
@@ -144,6 +164,17 @@ local function complete(params)
       end
     end
     return out
+  end
+
+  local x = before:match "^%s*#%s*@expect%s+(.*)$"
+  if x then
+    if not x:find "%s" then
+      return items({ "status", "headers.", "body." }, K.Field)
+    end
+    if x:match "^%S+%s+%S*$" then
+      return items(expect.OPS, K.Operator)
+    end
+    return {}
   end
 
   if before:match "^%s*#%s*@[%w%-]*$" then
@@ -190,13 +221,20 @@ local function hover(params)
   if not r then
     return nil
   end
-  local s = g.scan(lines)
+  local s = scan(lines, params.textDocument.uri)
   local kind, name = kind_of(s, r.ref)
   local text
   if kind == "var" then
     local v = s.vars[r.ref].value
     local sh = v:match "^%$%((.*)%)$"
     text = sh and ("shell, runs on send:\n```sh\n" .. sh .. "\n```") or ("```\n" .. v .. "\n```")
+  elseif kind == "envfile" then
+    local v = s.env[r.ref]
+    text = ("%s\n\n*%s, environment `%s`*"):format(
+      v.private and "`••••••` (private)" or ("```\n" .. v.value .. "\n```"),
+      vim.fn.fnamemodify(v.file, ":~:."),
+      env.active or "$shared"
+    )
   elseif kind == "response" then
     local resp = g.responses[name]
     local v = resp and g.field(resp, r.ref:sub(#name + 2))
@@ -216,8 +254,17 @@ local function definition(params)
   if not r then
     return nil
   end
-  local s = g.scan(lines)
+  local s = scan(lines, params.textDocument.uri)
   local kind, name = kind_of(s, r.ref)
+  if kind == "envfile" then
+    local file = s.env[r.ref].file
+    for i, l in ipairs(vim.fn.readfile(file)) do
+      if l:find('"' .. r.ref .. '"', 1, true) then
+        local pos = { line = i - 1, character = 0 }
+        return { uri = vim.uri_from_fname(file), range = { start = pos, ["end"] = pos } }
+      end
+    end
+  end
   local line = kind == "var" and s.vars[r.ref].line or (kind == "response" and s.names[name] and s.names[name].name_line)
   if not line then
     return nil
@@ -228,8 +275,8 @@ local function definition(params)
   }
 end
 
-function M.diagnostics(lines)
-  local s = g.scan(lines)
+function M.diagnostics(lines, uri)
+  local s = scan(lines, uri)
   local out = {}
   local function add(row, s_col, e_col, msg, sev)
     out[#out + 1] = {
@@ -250,6 +297,11 @@ function M.diagnostics(lines)
     local d = l:match "^%s*#%s*@([%w%-]+)"
     if d and not DIRECTIVES[d] then
       add(row, 0, #l, "unknown directive @" .. d .. " (ignored)", vim.lsp.protocol.DiagnosticSeverity.Hint)
+    elseif d == "expect" then
+      local _, err = expect.parse(l:match "@expect%s*(.-)%s*$")
+      if err then
+        add(row, 0, #l, err, vim.lsp.protocol.DiagnosticSeverity.Error)
+      end
     end
   end
   for _, b in ipairs(s.blocks) do
@@ -285,8 +337,17 @@ local handlers = {
   ["textDocument/definition"] = definition,
 }
 
+local refreshers = {} -- one per running server: re-publish diagnostics for its open docs
+
+--- Re-lint every open .http buffer (after `:Honk env`, say).
+function M.refresh()
+  for _, f in pairs(refreshers) do
+    f()
+  end
+end
+
 local function server(dispatchers)
-  local closing, id = false, 0
+  local closing, id, open = false, 0, {}
   local function publish(uri)
     vim.schedule(function()
       if closing or not vim.api.nvim_buf_is_loaded(vim.uri_to_bufnr(uri)) then
@@ -294,9 +355,14 @@ local function server(dispatchers)
       end
       dispatchers.notification("textDocument/publishDiagnostics", {
         uri = uri,
-        diagnostics = M.diagnostics((buf_lines(uri))),
+        diagnostics = M.diagnostics((buf_lines(uri)), uri),
       })
     end)
+  end
+  refreshers[dispatchers] = function()
+    for uri in pairs(open) do
+      publish(uri)
+    end
   end
   return {
     request = function(method, params, callback)
@@ -308,9 +374,13 @@ local function server(dispatchers)
     end,
     notify = function(method, params)
       if method == "textDocument/didOpen" or method == "textDocument/didChange" then
+        open[params.textDocument.uri] = true
         publish(params.textDocument.uri)
+      elseif method == "textDocument/didClose" then
+        open[params.textDocument.uri] = nil
       elseif method == "exit" then
         closing = true
+        refreshers[dispatchers] = nil
         dispatchers.on_exit(0, 15)
       end
     end,
@@ -319,6 +389,7 @@ local function server(dispatchers)
     end,
     terminate = function()
       closing = true
+      refreshers[dispatchers] = nil
     end,
   }
 end

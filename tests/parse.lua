@@ -95,4 +95,72 @@ r = assert(p.parse(lines, 6))
 assert(r.headers[1] == "Authorization: Bearer t", vim.inspect(r.headers))
 assert(r.url == "http://h/x/5?sid=7&s=200", r.url)
 assert(not pcall(p.parse, { "### a", "# @name a", "GET http://h/{{a.body.x}}" }, 3), "self reference must fail")
+
+-- @expect
+local expect = require "gooseman.expect"
+assert(vim.deep_equal(expect.parse "status == 200", { path = "status", op = "==", value = "200" }))
+assert(expect.parse("body.x exists").op == "exists")
+assert(expect.parse("body.n <= 3").op == "<=")
+assert(select(2, expect.parse "status ~= 1"):find "unknown operator")
+assert(select(2, expect.parse "body.x exists 1"):find "takes no value")
+assert(select(2, expect.parse "status =="):find "needs a value")
+local resp = p.to_response("GET", 'HTTP/1.1 201 Created\r\nX-Id: a1\r\n\r\n{"n":5,"tags":["a","b"],"z":null}')
+local id = function(v) return v end
+local checks = expect.check({
+  { text = "status == 201" }, { text = "status < 300" }, { text = "body.n > 10" },
+  { text = "body.tags.1 == b" }, { text = "body.z !exists" }, { text = "headers.x-id matches ^a%d$" },
+  { text = "body.tags contains \"a\"" }, { text = "body.missing exists" },
+}, resp, 0, p.field, id)
+local oks = vim.tbl_map(function(c) return c.ok end, checks)
+assert(vim.deep_equal(oks, { true, true, false, true, true, true, true, false }), vim.inspect(checks))
+assert(expect.check({}, resp, 0, p.field, id)[1].ok)
+assert(not expect.check({}, p.to_response("GET", "HTTP/1.1 500 X\r\n\r\n"), 0, p.field, id)[1].ok)
+
+-- curl import / export
+local curl = require "gooseman.curl"
+assert(vim.deep_equal(curl.words [[curl -H 'A: b c' "x\"y" $'l1\nl2' a\ b \
+  --x]], { "curl", "-H", "A: b c", 'x"y', "l1\nl2", "a b", "--x" }))
+local block = curl.to_http [[curl 'https://api.x/v1/geese?id=1' -XPOST -H 'Accept: application/json' -u gooseman:secret --data-raw '{"a":1}' -sSL --compressed -b 'sid=1' --max-time 5]]
+assert(vim.deep_equal(block, {
+  "### imported from curl",
+  "# @args -L --compressed --max-time 5",
+  "POST https://api.x/v1/geese?id=1",
+  "Accept: application/json",
+  "Authorization: Basic " .. vim.base64.encode "gooseman:secret",
+  "Cookie: sid=1",
+  "Content-Type: application/x-www-form-urlencoded",
+  "",
+  '{"a":1}',
+}), vim.inspect(block))
+block = curl.to_http "curl --json '{\"a\":1}' https://x/y"
+assert(block[2] == "POST https://x/y" and block[3] == "Content-Type: application/json", vim.inspect(block))
+assert(curl.to_http("curl https://x")[2] == "GET https://x")
+assert(not pcall(curl.to_http, "wget https://x"))
+-- round trip: .http -> curl -> .http
+r = assert(p.parse({ "POST http://h/a", "X-A: it's", "", "{\"k\": 1}" }, 1))
+local line = curl.export(p.command(r))
+assert(line == [[curl -X POST http://h/a -H 'X-A: it'\''s' --data-binary '{"k": 1}']], line)
+local back = curl.to_http(line)
+assert(back[2] == "POST http://h/a" and back[3] == "X-A: it's" and back[#back] == '{"k": 1}', vim.inspect(back))
+assert(curl.export(p.command(assert(p.parse({ "GET http://h/x" }, 1)))) == "curl http://h/x")
+local ws = curl.export(p.command(assert(p.parse({ "WS ws://h", "", "hi there" }, 1))))
+assert(ws == "printf '%s\\n' 'hi there' | websocat ws://h", ws)
+
+-- environments: $shared < active env < private file; file @vars win over all
+local env = require "gooseman.env"
+local dir = vim.fn.tempname()
+vim.fn.mkdir(dir .. "/sub", "p")
+vim.fn.writefile({ '{"$shared": {"a": "shared", "b": "shared"}, "dev": {"b": "dev", "c": "{{a}}-x"}}' }, dir .. "/gooseman.json")
+vim.fn.writefile({ '{"dev": {"secret": "s3"}}' }, dir .. "/gooseman.private.json")
+local path = dir .. "/sub/api.http"
+assert(vim.deep_equal(env.names(path), { "dev" }))
+env.active = "dev"
+lines = { "@b = file", "GET http://h/{{a}}/{{b}}/{{c}}/{{secret}}" }
+r = assert(p.parse(lines, 2, path))
+assert(r.url == "http://h/shared/file/shared-x/s3", r.url)
+assert(env.vars(path).secret.private)
+env.active = nil
+r = assert(p.parse(lines, 2, path))
+assert(r.url == "http://h/shared/file/{{c}}/{{secret}}", r.url)
+vim.fn.delete(dir, "rf")
 print "ok"

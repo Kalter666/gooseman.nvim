@@ -1,0 +1,23 @@
+# Environments: variables come from gooseman.json next to this file (or any parent dir).
+#   :Honk env dev      :Honk env staging      :Honk env none      :Honk env  (picker)
+# Secrets go in gooseman.private.json (same shape, gitignored); it wins over gooseman.json.
+# Note: an @var in the file wins over the environment, so don't also define @host here.
+#
+# Start the fake servers: python3 tests/echo_server.py  and  (cd tests/grpc_server && go run .)
+
+# @header Authorization: Bearer {{login.body.token}}
+
+### login with the environment's credentials
+# @name login
+POST {{host}}/login
+Content-Type: application/json
+
+{"user": "{{user}}", "password": "{{password}}"}
+
+### which host am I hitting? ({{host}} changes with :Honk env)
+GET {{host}}/whoami
+
+### gRPC address comes from $shared
+GRPC {{grpc}} grpc.health.v1.Health/Check
+
+{"service": "goose"}

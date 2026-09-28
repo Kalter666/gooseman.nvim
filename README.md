@@ -15,7 +15,9 @@
 ---
 
 Write requests in a `.http` file, put the cursor inside one, run `:Honk`.
-Name a login once and every other request reuses its token. A built-in LSP completes it all.
+Name a login once and every other request reuses its token. Switch between dev and prod environments,
+assert on responses and run a whole file as a smoke test, and paste curl commands straight from browser devtools.
+A built-in LSP completes it all.
 The goose doesn't reinvent anything. It hands each request to a tool you already trust:
 
 | Request line                              | Tool       | Result                                         |
@@ -40,6 +42,19 @@ Needs Neovim 0.10+ and whichever tools you use: `curl`, `grpcurl`, `websocat`, `
 ```
 
 No `setup()` needed.
+
+## ⌨️ Commands
+
+| Command                 | What it does                                                               |
+| ----------------------- | -------------------------------------------------------------------------- |
+| `:Honk`                 | send the request under the cursor                                          |
+| `:Honk!`                | same, but forget cached named responses first (fresh login)                |
+| `:Honk all`             | run every request in the file top to bottom; ✓/✗ report + quickfix        |
+| `:Honk env [name]`      | pick an environment from `gooseman.json` (no name = picker, `none` = off)  |
+| `:Honk curl`            | copy the request under the cursor as a shell command                      |
+| `:Honk import`          | clipboard curl command → `.http` block (`:'<,'>Honk import` converts a selection in place) |
+
+Statusline: `require("gooseman").statusline()` returns `🪿 dev` while an environment is active.
 
 ## 📝 The `.http` format
 
@@ -191,13 +206,68 @@ Authorization: Bearer someone-else
 
 - **Runs on demand.** The first `:Honk` that needs `{{login.…}}` runs `login` first, then caches its response.
 - **Cached for the session.** Any file can use the cache: honk `login` in `auth.http` and use `{{login.body.token}}` in `orders.http`.
-- **Refresh.** Honk `login` again to refresh it, or run `:Honk!` to forget every cached response and re-run what's needed. Use this when a token expires.
+- **Auto-refresh.** A request that gets a **401** while using a cached response re-runs that dependency
+  and retries once. Honk `login` again to refresh it by hand, or run `:Honk!` to forget every cached response.
 - **No self-reference.** A request never uses its own response: `login` skips the file-wide header built from it.
 - **Response fields:** `status`, `headers.<name>` (any case), and `body.<key>.<key>`. Arrays use a 0-based index: `{{list.body.items.0.id}}`.
   gRPC responses work the same way (`body` is the JSON reply).
 - **Chaining** works the same way: create something, then use `{{created.body.id}}` in the next request.
+- **Rate limits.** Auto-refresh stays conservative:
+  - only on 401 (403 means forbidden, and a new token won't help)
+  - each named request is refreshed at most once per 60s (`require("gooseman").REFRESH_COOLDOWN`), so a run with
+    ten 401s logs in once, not ten times
+  - `vim.g.gooseman_auto_refresh = false` turns it off
 - **Cookie sessions:** put `# @args -b /tmp/jar -c /tmp/jar` before the first `###` (HTTP-only files, since
   file-wide `@args` go to every tool).
+
+## 🌍 Environments
+
+Put a `gooseman.json` next to your `.http` files (or in any parent directory):
+
+```json
+{
+  "$shared": { "user": "gooseman" },
+  "dev":     { "host": "http://localhost:8080" },
+  "prod":    { "host": "https://api.example.com" }
+}
+```
+
+`:Honk env prod` switches, and `{{host}}` follows. `$shared` applies to every environment.
+Keep secrets in `gooseman.private.json` (same shape, add it to `.gitignore`). It wins over `gooseman.json`,
+and the LSP hover masks its values. Environment values can use `{{refs}}` and `$(shell)` like `@vars`.
+An `@var` in the file wins over the environment.
+
+## ✅ Asserts & smoke tests
+
+```http
+### login
+# @name login
+# @expect status == 200
+# @expect body.token exists
+# @expect headers.content-type contains json
+POST {{host}}/login
+...
+```
+
+`# @expect <path> <op> [value]`:
+
+- **path:** `status`, `headers.<name>` or `body.<key>.<0-based index>`, the same paths as `{{name.…}}`.
+- **op:** `==` `!=` `<` `<=` `>` `>=` `contains` `matches` (Lua pattern) `exists` `!exists`. Numbers compare as numbers.
+- **values** can use `{{refs}}`: `# @expect body.owner == {{user}}`.
+- **no `@expect`:** the request passes when it exits 0 with status < 400.
+
+`:Honk` shows the ✓/✗ lines above the response. `:Honk all` runs the whole file in order, so logins and
+chains work, and prints a report. Failures go to the quickfix list. See [`examples/tests.http`](examples/tests.http).
+
+## 📋 curl in and out
+
+- **`:Honk curl`** copies the request under the cursor as a ready-to-share command: curl, grpcurl, or websocat.
+  Variables are already filled in.
+- **`:Honk import`** turns a curl command (from devtools **Copy as cURL**, docs, Slack…) into a `.http` block:
+  - `-u` becomes a Basic header, `-b` a Cookie header, `--json` sets the JSON headers
+  - `-d`/`--data-raw` becomes the body
+  - `-L`, `-k`, `--compressed` and other flags go into `# @args`
+  - It handles `'…'`, `"…"`, `$'…'` quoting and `\` line continuations.
 
 ## 🧠 Built-in LSP
 
@@ -206,10 +276,10 @@ and your usual LSP keymaps and completion plugin (blink.cmp, nvim-cmp) pick it u
 
 | Feature         | What it does                                                                             |
 | --------------- | ---------------------------------------------------------------------------------------- |
-| Completion      | `{{` variables and named requests, `{{login.body.` response fields (from the cache), methods, headers, common header values, `# @` directives |
-| Hover           | what `{{ref}}` resolves to. Shell vars show their command without running it; env vars show only whether they're set |
-| Go to definition| `{{ref}}` jumps to its `@var` line or the `# @name` line                                 |
-| Diagnostics     | undefined `{{refs}}`, unknown methods, unknown directives, duplicate `@name`s            |
+| Completion      | `{{` variables, environment variables and named requests, `{{login.body.` response fields (from the cache), methods, headers, common header values, `# @` directives, `@expect` paths and operators |
+| Hover           | what `{{ref}}` resolves to. Shell vars show their command without running it; private environment values and OS env vars are masked |
+| Go to definition| `{{ref}}` jumps to its `@var` line, the `# @name` line, or the entry in `gooseman.json`  |
+| Diagnostics     | undefined `{{refs}}` (re-checked on `:Honk env`), unknown methods, unknown directives, invalid `@expect`, duplicate `@name`s |
 
 ## 🛰️ gRPC
 
@@ -235,7 +305,9 @@ websocat -t ws-l:127.0.0.1:9000 mirror:         # WebSocket echo on :9000
 
 Then open [`examples/`](examples) and honk away:
 [`basics.http`](examples/basics.http) · [`auth.http`](examples/auth.http) · [`reuse.http`](examples/reuse.http) ·
-[`grpc.http`](examples/grpc.http) · [`websocket.http`](examples/websocket.http)
+[`grpc.http`](examples/grpc.http) · [`websocket.http`](examples/websocket.http) ·
+[`environments.http`](examples/environments.http) + [`gooseman.json`](examples/gooseman.json) ·
+[`tests.http`](examples/tests.http) (`:Honk all`)
 
 Parser tests: `nvim -l tests/parse.lua`
 

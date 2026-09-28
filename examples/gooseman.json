@@ -1,0 +1,18 @@
+{
+  "$shared": {
+    "user": "gooseman",
+    "grpc": "grpc://localhost:50051"
+  },
+  "dev": {
+    "host": "http://localhost:8080",
+    "password": "secret"
+  },
+  "staging": {
+    "host": "http://127.0.0.1:8080",
+    "password": "secret"
+  },
+  "broken": {
+    "host": "http://localhost:8080",
+    "password": "wrong"
+  }
+}

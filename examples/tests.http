@@ -1,0 +1,63 @@
+# A smoke test: `:Honk all` runs every request top to bottom and reports ✓/✗,
+# failures land in the quickfix list. Works with any environment: :Honk env dev
+#
+#   # @expect <path> <op> [value]
+#   path: status | headers.<name> | body.<key>.<0-based index>...
+#   op:   == != < <= > >= contains matches exists !exists
+# Without @expect, a request passes when it exits 0 with status < 400.
+#
+# Start the fake servers: python3 tests/echo_server.py  and  (cd tests/grpc_server && go run .)
+
+@host = http://localhost:8080
+# @header Authorization: Bearer {{login.body.token}}
+
+### login
+# @name login
+# @expect status == 200
+# @expect body.token matches ^login%-%d+$
+# @expect headers.set-cookie contains session=
+POST {{host}}/login
+Content-Type: application/json
+
+{"user": "gooseman", "password": "secret"}
+
+### the token works
+# @expect status == 200
+# @expect body.headers.Authorization == Bearer {{login.body.token}}
+GET {{host}}/bearer
+
+### create and check the echo
+# @name goose
+# @expect body.body.tags.1 == chaotic
+# @expect body.body.age >= 3
+POST {{host}}/geese
+Content-Type: application/json
+
+{"name": "honk", "tags": ["loud", "chaotic"], "age": 5}
+
+### chained request uses the previous response
+# @expect body.path == /geese/honk
+GET {{host}}/geese/{{goose.body.body.name}}
+
+### wrong credentials must be rejected
+# @expect status == 401
+# @expect body.error exists
+GET {{host}}/basic
+Authorization: Basic bm9wZTpub3Bl
+
+### unknown routes 404
+# @expect status == 404
+GET {{host}}/missing/1
+
+### token expiry: log out (revokes login tokens)...
+POST {{host}}/logout
+
+### ...the next request gets 401, re-runs login and retries by itself
+# @expect status == 200
+GET {{host}}/bearer
+
+### gRPC: headers become metadata; body fields are assertable
+# @expect body.status == SERVING
+GRPC grpc://localhost:50051 grpc.health.v1.Health/Check
+
+{"service": "goose"}

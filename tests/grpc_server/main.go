@@ -3,7 +3,8 @@
 // run: cd tests/grpc_server && go run . [addr]   (default localhost:50051)
 //
 // Reflection (grpcurl list/describe) is open. Unary calls need metadata
-// "authorization: Bearer static-token", otherwise Unauthenticated.
+// "authorization: Bearer static-token" (or a login-* token from echo_server.py),
+// otherwise Unauthenticated.
 package main
 
 import (
@@ -11,6 +12,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -23,7 +25,7 @@ import (
 
 func auth(ctx context.Context, req any, _ *grpc.UnaryServerInfo, next grpc.UnaryHandler) (any, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
-	if v := md.Get("authorization"); len(v) == 0 || v[0] != "Bearer static-token" {
+	if v := md.Get("authorization"); len(v) == 0 || (v[0] != "Bearer static-token" && !strings.HasPrefix(v[0], "Bearer login-")) {
 		return nil, status.Error(codes.Unauthenticated, "want authorization: Bearer static-token")
 	}
 	return next(ctx, req)

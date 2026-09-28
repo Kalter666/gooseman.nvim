@@ -8,12 +8,14 @@ Auth-protected routes (401 when credentials are wrong):
   /bearer        Bearer token "static-token" or one issued by /oauth/token
   /apikey        header "X-API-Key: k3y" or query "?api_key=k3y"
   /cookie        cookie "session=s3ss"
-  /login         POST {"user": "gooseman", "password": "secret"} -> sets the cookie, returns a token
+  /login         POST {"user": "gooseman", "password": "secret"} -> sets the cookie, returns a fresh token
+  /logout        revokes every token /login issued (simulates expiry)
   /oauth/token   POST form grant_type=client_credentials, client "cli" / "cli-secret"
                  (form fields or Basic auth) -> {"access_token": ...}
   /missing/...   always 404
 """
 import base64
+import itertools
 import json
 import sys
 from http.cookies import SimpleCookie
@@ -21,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 TOKENS = {"static-token"}
+ISSUED = itertools.count(1)
 
 
 def basic(header, user, password):
@@ -70,7 +73,13 @@ class Echo(BaseHTTPRequestHandler):
                 creds = {}
             if creds != {"user": "gooseman", "password": "secret"}:
                 return self.reply(401, {"error": "bad credentials"})
-            return self.reply(200, {"token": "static-token"}, [("Set-Cookie", "session=s3ss; HttpOnly")])
+            token = f"login-{next(ISSUED)}"
+            TOKENS.add(token)
+            return self.reply(200, {"token": token}, [("Set-Cookie", "session=s3ss; HttpOnly")])
+
+        if url.path == "/logout":
+            TOKENS.difference_update({t for t in TOKENS if t.startswith("login-")})
+            return self.reply(200, {"revoked": True})
 
         checks = {
             "/basic": lambda: basic(auth, "gooseman", "secret"),
