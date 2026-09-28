@@ -2,7 +2,7 @@
 
 # 🪿 gooseman.nvim
 
-**A postman goose. Point it at a request, it honks it at the server.**
+**A goose that delivers your requests. Point it at one, it honks it at the server.**
 
 *HTTP, gRPC and WebSocket requests from plain `.http` files, right in Neovim.*
 
@@ -15,6 +15,7 @@
 ---
 
 Write requests in a `.http` file, put the cursor inside one, run `:Honk`.
+Name a login once and every other request reuses its token. A built-in LSP completes it all.
 The goose doesn't reinvent anything. It hands each request to a tool you already trust:
 
 | Request line                              | Tool       | Result                                         |
@@ -62,6 +63,10 @@ Content-Type: application/json
   It runs on every `:Honk` that uses it.
 - **Raw flags**: `# @args ...` inside a block appends flags to curl/grpcurl/websocat for that request only
   (`-u`, `--cert`, `-insecure`, `-proto`, `--basic-auth`, …). Split on whitespace, no quoting.
+- **Named requests**: `# @name login` lets any request use its response:
+  `{{login.body.token}}`, `{{login.headers.Set-Cookie}}`, `{{login.status}}`. See [reusing auth](#️-reusing-auth-across-requests).
+- **File-wide settings**: before the first `###`, `# @header K: V` adds a header to every request
+  and `# @args ...` adds flags to every request. A request's own header with the same name wins.
 
 > ⚠️ `$(…)` variables run shell commands, so only honk `.http` files you trust.
 
@@ -95,7 +100,8 @@ GET {{host}}/bearer
 Authorization: Bearer {{token}}
 ```
 
-**Login, then use the token**:
+**Login, then use the token.** The best way is a named request (see [below](#️-reusing-auth-across-requests)).
+A one-off shell variable works too:
 
 ```http
 @login_token = $(curl -s {{host}}/login -H 'Content-Type: application/json' -d '{"user":"gooseman","password":"secret"}' | jq -r .token)
@@ -160,6 +166,51 @@ Authorization: Bearer {{GOOSE_TOKEN}}
 WS wss://api.example.com/stream
 ```
 
+## ♻️ Reusing auth across requests
+
+Name the login request once, then point a file-wide header at its response:
+
+```http
+@host = http://localhost:8080
+# @header Authorization: Bearer {{login.body.token}}
+
+### login
+# @name login
+POST {{host}}/login
+Content-Type: application/json
+
+{"user": "gooseman", "password": "secret"}
+
+### every request below is authorized, HTTP and gRPC alike
+GET {{host}}/me
+
+### override for one request
+GET {{host}}/me
+Authorization: Bearer someone-else
+```
+
+- **Runs on demand.** The first `:Honk` that needs `{{login.…}}` runs `login` first, then caches its response.
+- **Cached for the session.** Any file can use the cache: honk `login` in `auth.http` and use `{{login.body.token}}` in `orders.http`.
+- **Refresh.** Honk `login` again to refresh it, or run `:Honk!` to forget every cached response and re-run what's needed. Use this when a token expires.
+- **No self-reference.** A request never uses its own response: `login` skips the file-wide header built from it.
+- **Response fields:** `status`, `headers.<name>` (any case), and `body.<key>.<key>`. Arrays use a 0-based index: `{{list.body.items.0.id}}`.
+  gRPC responses work the same way (`body` is the JSON reply).
+- **Chaining** works the same way: create something, then use `{{created.body.id}}` in the next request.
+- **Cookie sessions:** put `# @args -b /tmp/jar -c /tmp/jar` before the first `###` (HTTP-only files, since
+  file-wide `@args` go to every tool).
+
+## 🧠 Built-in LSP
+
+Opening a `.http` file starts a tiny language server inside Neovim. There's no binary and nothing to configure,
+and your usual LSP keymaps and completion plugin (blink.cmp, nvim-cmp) pick it up.
+
+| Feature         | What it does                                                                             |
+| --------------- | ---------------------------------------------------------------------------------------- |
+| Completion      | `{{` variables and named requests, `{{login.body.` response fields (from the cache), methods, headers, common header values, `# @` directives |
+| Hover           | what `{{ref}}` resolves to. Shell vars show their command without running it; env vars show only whether they're set |
+| Go to definition| `{{ref}}` jumps to its `@var` line or the `# @name` line                                 |
+| Diagnostics     | undefined `{{refs}}`, unknown methods, unknown directives, duplicate `@name`s            |
+
 ## 🛰️ gRPC
 
 - `GRPC host:port` lists services (uses server reflection).
@@ -183,7 +234,7 @@ websocat -t ws-l:127.0.0.1:9000 mirror:         # WebSocket echo on :9000
 ```
 
 Then open [`examples/`](examples) and honk away:
-[`basics.http`](examples/basics.http) · [`auth.http`](examples/auth.http) ·
+[`basics.http`](examples/basics.http) · [`auth.http`](examples/auth.http) · [`reuse.http`](examples/reuse.http) ·
 [`grpc.http`](examples/grpc.http) · [`websocket.http`](examples/websocket.http)
 
 Parser tests: `nvim -l tests/parse.lua`

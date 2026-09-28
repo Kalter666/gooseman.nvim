@@ -1,0 +1,58 @@
+# Log in once, reuse the result everywhere.
+#   python3 tests/echo_server.py   and   (cd tests/grpc_server && go run .)
+#
+# `# @name login` names a request. Anything can then use its response:
+#   {{login.body.token}}  {{login.headers.Set-Cookie}}  {{login.status}}  {{x.body.items.0.id}}
+# First use runs `login` automatically; after that the response is cached for the session.
+# Re-honking `login` refreshes it; `:Honk!` forgets all cached responses (token expired?).
+
+@host = http://localhost:8080
+
+# File-wide header: every request below gets it (gRPC too, as metadata).
+# `login` itself is skipped automatically, it can't use its own token.
+# @header Authorization: Bearer {{login.body.token}}
+
+### login
+# @name login
+POST {{host}}/login
+Content-Type: application/json
+
+{"user": "gooseman", "password": "secret"}
+
+### authorized through the file-wide header (runs login first if needed)
+GET {{host}}/bearer
+
+### a request's own header wins over the file-wide one
+GET {{host}}/bearer
+Authorization: Bearer nope
+
+### gRPC gets the same header as metadata
+GRPC grpc://localhost:50051 grpc.health.v1.Health/Check
+
+{"service": "goose"}
+
+### status and response headers are reusable too
+GET {{host}}/cookie
+Cookie: {{login.headers.Set-Cookie}}
+X-Login-Status: {{login.status}}
+
+### chain requests: create something...
+# @name goose
+POST {{host}}/geese
+Content-Type: application/json
+
+{"name": "honk", "tags": ["loud", "chaotic"]}
+
+### ...then use fields from its response (nested keys, 0-based array index)
+GET {{host}}/geese/{{goose.body.body.name}}?tag={{goose.body.body.tags.0}}
+
+### OAuth2 as a named request instead of a $(shell) variable
+# @name oauth
+POST {{host}}/oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&client_id=cli&client_secret=cli-secret
+
+### use the OAuth token
+GET {{host}}/bearer
+Authorization: Bearer {{oauth.body.access_token}}

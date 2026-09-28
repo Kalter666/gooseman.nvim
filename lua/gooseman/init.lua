@@ -2,111 +2,315 @@
 --   GET/POST/...  -> curl      (response in a scratch split)
 --   GRPC          -> grpcurl   (server reflection; no method = list services)
 --   WS            -> websocat  (interactive terminal; body lines sent on connect)
---   `# @args ...` in a block appends raw flags to the tool (mTLS, -proto, -k, ...)
+--
+-- Directives (comment lines):
+--   # @name login   name a request; others use {{login.body.token}}, {{login.headers.X}},
+--                   {{login.status}}. Runs on first use, then cached for the session.
+--   # @args ...     raw flags for the tool (mTLS, -proto, -k, cookie jars, ...)
+--   # @header K: V  (before the first ###) header added to every request in the file
+-- Before the first ###, @args also applies to every request.
 
 local M = {}
 
-local HTTP_METHODS = {
+M.METHODS = {
   GET = true, POST = true, PUT = true, PATCH = true, DELETE = true,
   HEAD = true, OPTIONS = true, TRACE = true, CONNECT = true,
+  GRPC = true, WS = true,
 }
 
--- `@name = value` lines anywhere in the file; later wins.
-local function collect_vars(lines)
-  local vars = {}
-  for _, l in ipairs(lines) do
-    local k, v = l:match "^@([%w_%-%.]+)%s*=%s*(.-)%s*$"
-    if k then
-      vars[k] = v
-    end
-  end
-  return vars
+--- Responses of named requests, shared by every file for the session. `:Honk!` clears it.
+---@type table<string, {status:integer, headers:table<string,string>, body:any}>
+M.responses = {}
+
+local function is_comment(l)
+  return l:match "^%s*#" or l:match "^%s*//"
 end
 
--- {{name}} -> file var, else env var, else left as is.
--- File vars may reference other vars; a `$(cmd)` value runs through sh when first used.
--- ponytail: `$(cmd)` runs synchronously on every send; cache tokens to a file if the cmd is slow
-local function expand(s, vars, depth)
-  depth = depth or 0
-  if depth > 10 then
-    error "variables reference each other too deep (cycle?)"
-  end
-  return (s:gsub("{{%s*([%w_%-%.]+)%s*}}", function(k)
-    local v = vars[k]
-    if v == nil then
-      return os.getenv(k)
-    elseif type(v) == "table" then -- already resolved during this send
-      return v[1]
+--- Structure of a .http file; shared by the sender and the LSP. Nothing is expanded here.
+function M.scan(lines)
+  local s = { vars = {}, names = {}, blocks = {}, file_headers = {}, file_args = {}, dups = {} }
+  local seps = {}
+  for i, l in ipairs(lines) do
+    if l:match "^###" then
+      seps[#seps + 1] = i
     end
-    v = expand(v, vars, depth + 1)
+  end
+  local ranges = {}
+  if #seps == 0 then
+    ranges[1] = { first = 1, last = #lines }
+  else
+    if seps[1] > 1 then
+      ranges[1] = { first = 1, last = seps[1] - 1, preamble = true }
+    end
+    for j, sep in ipairs(seps) do
+      ranges[#ranges + 1] = { first = sep + 1, last = (seps[j + 1] or #lines + 1) - 1, sep = sep }
+    end
+  end
+
+  for _, b in ipairs(ranges) do
+    b.args, b.headers, b.body = {}, {}, {}
+    local state = "pre"
+    for i = b.first, b.last do
+      local l = lines[i]
+      if state == "body" then
+        b.body[#b.body + 1] = i
+      else
+        local k, v = l:match "^@([%w_%-]+)%s*=%s*(.-)%s*$"
+        local d, dv = l:match "^%s*#%s*@([%w%-]+)%s*(.-)%s*$"
+        if k then
+          s.vars[k] = { value = v, line = i }
+        elseif d == "name" then
+          if s.names[dv] then
+            table.insert(s.dups, { name = dv, line = i })
+          end
+          b.name, b.name_line = dv, i
+          s.names[dv] = b
+        elseif d == "args" then
+          table.insert(b.preamble and s.file_args or b.args, { text = dv, line = i })
+        elseif d == "header" and b.preamble then
+          table.insert(s.file_headers, { text = dv, line = i })
+        elseif is_comment(l) then
+          -- comment (or unknown directive; the LSP flags those)
+        elseif state == "pre" then
+          if l:match "%S" then
+            b.req = { text = vim.trim(l), line = i }
+            state = "headers"
+          end
+        elseif l:match "^%s*$" then
+          state = "body"
+        else
+          table.insert(b.headers, { text = vim.trim(l), line = i })
+        end
+      end
+    end
+    -- trailing blank/comment lines belong to the gap before the next ###, not the body
+    while #b.body > 0 and (lines[b.body[#b.body]]:match "^%s*$" or is_comment(lines[b.body[#b.body]])) do
+      table.remove(b.body)
+    end
+    table.insert(s.blocks, b)
+  end
+  return s
+end
+
+function M.block_at(s, row)
+  for _, b in ipairs(s.blocks) do
+    if (row >= b.first and row <= b.last) or row == b.sep then
+      return b
+    end
+  end
+end
+
+--- Every {{ref}} in a string: returns list of {ref, start_col, end_col} (1-based, inclusive).
+function M.refs(str)
+  local out, init = {}, 1
+  while true do
+    local s, e, ref = str:find("{{%s*([%w_%-%.]+)%s*}}", init)
+    if not s then
+      return out
+    end
+    out[#out + 1] = { ref = ref, s = s, e = e }
+    init = e + 1
+  end
+end
+
+--- Read a dotted path out of a stored response: status | headers.<name> | body.<key>.<index0>...
+function M.field(resp, path)
+  local parts = vim.split(path, ".", { plain = true })
+  local v
+  if parts[1] == "status" then
+    v = resp.status
+  elseif parts[1] == "headers" then
+    v = resp.headers[(table.concat(parts, ".", 2)):lower()]
+  elseif parts[1] == "body" then
+    v = resp.body
+    for i = 2, #parts do
+      if type(v) ~= "table" then
+        v = nil
+        break
+      end
+      local n = tonumber(parts[i])
+      v = (n and vim.islist(v)) and v[n + 1] or v[parts[i]]
+    end
+  end
+  if v == nil or v == vim.NIL then
+    return nil
+  end
+  return type(v) == "table" and vim.json.encode(v) or tostring(v)
+end
+
+-- Split curl -i output into header blocks (redirects/100-continue give several) and body.
+local function split_http(out)
+  out = out:gsub("\r", "")
+  local heads = {}
+  while out:match "^HTTP/" do
+    local h, rest = out:match "^(.-\n)\n(.*)$"
+    if not h then
+      break
+    end
+    heads[#heads + 1], out = h, rest
+  end
+  return heads, out
+end
+
+--- Turn tool output into {status, headers, body}; JSON bodies are decoded.
+function M.to_response(method, stdout)
+  local resp = { status = 0, headers = {} }
+  local body = stdout
+  if method ~= "GRPC" then
+    local heads
+    heads, body = split_http(stdout)
+    local last = heads[#heads] or ""
+    resp.status = tonumber(last:match "^HTTP/%S+%s+(%d+)") or 0
+    for k, v in last:gmatch "\n([^:\n]+):%s*([^\n]*)" do
+      resp.headers[k:lower()] = v
+    end
+  end
+  local ok, decoded = pcall(vim.json.decode, body)
+  resp.body = ok and decoded or body
+  return resp
+end
+
+local expand
+
+-- Response of a named request: cached, or run it now (synchronously) and cache it.
+local function response_for(ctx, name, depth)
+  if M.responses[name] then
+    return M.responses[name]
+  end
+  local b = ctx.s.names[name]
+  if not b then
+    error(("request `%s` has not been sent yet"):format(name), 0)
+  end
+  if ctx.running[name] then
+    error({ cycle = name })
+  end
+  local req = M.build(ctx, b, depth + 1)
+  if req.method == "WS" then
+    error(("`%s` is a WS request; only HTTP/GRPC responses can be reused"):format(name), 0)
+  end
+  local cmd, stdin = M.command(req)
+  local r = vim.system(cmd, { stdin = stdin, text = true }):wait()
+  local resp = M.to_response(req.method, r.stdout)
+  if r.code ~= 0 or resp.status >= 400 then
+    error(("dependency `%s` failed (exit %d, status %d): %s"):format(name, r.code, resp.status, vim.trim(r.stderr)), 0)
+  end
+  M.responses[name] = resp
+  return resp
+end
+
+local function lookup(ctx, key, depth)
+  if ctx.resolved[key] then
+    return ctx.resolved[key]
+  end
+  local var = ctx.s.vars[key]
+  if var then
+    local v = expand(var.value, ctx, depth + 1)
     local sh = v:match "^%$%((.*)%)$"
     if sh then
       local r = vim.system({ "sh", "-c", sh }, { text = true }):wait()
       if r.code ~= 0 then
-        error(("@%s: `%s` failed: %s"):format(k, sh, vim.trim(r.stderr)), 0)
+        error(("@%s: `%s` failed: %s"):format(key, sh, vim.trim(r.stderr)), 0)
       end
       v = vim.trim(r.stdout)
     end
-    vars[k] = { v }
+    ctx.resolved[key] = v
     return v
+  end
+  local name, path = key:match "^([^.]+)%.(.+)$"
+  if name and (ctx.s.names[name] or M.responses[name]) then
+    if ctx.running[name] then -- even when cached: a request never feeds on its own old response
+      error({ cycle = name })
+    end
+    local v = M.field(response_for(ctx, name, depth), path)
+    if not v then
+      error(("response of `%s` has no %s"):format(name, path), 0)
+    end
+    return v
+  end
+  return os.getenv(key)
+end
+
+-- {{name}} -> file var (may reference others; `$(cmd)` runs through sh, once per send),
+-- else a named response field, else env var, else left as is.
+-- ponytail: `$(cmd)` runs synchronously on every send; name the request instead if it's a login
+function expand(str, ctx, depth)
+  depth = depth or 0
+  if depth > 10 then
+    error("variables reference each other too deep (cycle?)", 0)
+  end
+  return (str:gsub("{{%s*([%w_%-%.]+)%s*}}", function(k)
+    return lookup(ctx, k, depth)
   end))
 end
 
---- Parse the `###`-delimited block containing `row` (1-based).
----@return {method:string, url:string, target:string?, headers:string[], body:string}?, string? err
-function M.parse(lines, row)
-  local first, last = 1, #lines
-  for i = row, 1, -1 do
-    if lines[i]:match "^###" then
-      first = i + 1
-      break
+function M.context(lines)
+  return { lines = lines, s = M.scan(lines), resolved = {}, running = {} }
+end
+
+-- ponytail: whitespace split, no shell quoting; paths with spaces need a var without spaces
+local function split_args(list, ctx, depth, into)
+  for _, a in ipairs(list) do
+    vim.list_extend(into, vim.split(expand(a.text, ctx, depth), "%s+", { trimempty = true }))
+  end
+  return into
+end
+
+--- Expand a scanned block into a request.
+function M.build(ctx, b, depth)
+  depth = depth or 0
+  if not b.req then
+    error("no request under cursor", 0)
+  end
+  if b.name then
+    ctx.running[b.name] = true
+  end
+  local method, rest = b.req.text:match "^(%u+)%s+(.-)$"
+  if not (method and M.METHODS[method]) then
+    error("not a request line: " .. b.req.text, 0)
+  end
+  rest = expand(rest:gsub("%s+HTTP/[%d%.]+$", ""), ctx, depth)
+  local url, target = rest:match "^(%S+)%s*(.-)$"
+  local req = { method = method, url = url, target = target ~= "" and target or nil, name = b.name, headers = {} }
+
+  local own = {}
+  for _, h in ipairs(b.headers) do
+    own[(h.text:match "^([^:]+)" or ""):lower()] = true
+  end
+  for _, h in ipairs(ctx.s.file_headers) do
+    if not own[(h.text:match "^([^:]+)" or ""):lower()] then
+      -- a file-wide header built from this request's own response (auth via login) is skipped here
+      local ok, v = pcall(expand, h.text, ctx, depth)
+      if ok then
+        table.insert(req.headers, v)
+      elseif not (type(v) == "table" and v.cycle == b.name) then
+        error(v, 0)
+      end
     end
   end
-  for i = row + 1, #lines do
-    if lines[i]:match "^###" then
-      last = i - 1
-      break
-    end
+  for _, h in ipairs(b.headers) do
+    table.insert(req.headers, expand(h.text, ctx, depth))
   end
 
-  local vars = collect_vars(lines)
-  local req, body, in_body, args = nil, {}, false, {}
-  for i = first, last do
-    local l = lines[i]
-    local extra = not in_body and l:match "^%s*#%s*@args%s+(.-)%s*$"
-    if extra then
-      -- ponytail: whitespace split, no shell quoting; paths with spaces need a var without spaces
-      vim.list_extend(args, vim.split(expand(extra, vars), "%s+", { trimempty = true }))
-    elseif in_body then
-      body[#body + 1] = l
-    elseif l:match "^%s*#" or l:match "^%s*//" or l:match "^@" then
-      -- comment or variable
-    elseif not req then
-      if l:match "%S" then
-        local method, rest = l:match "^%s*(%u+)%s+(.-)%s*$"
-        if not method then
-          return nil, "not a request line: " .. l
-        end
-        rest = expand(rest:gsub("%s+HTTP/[%d%.]+$", ""), vars)
-        local url, target = rest:match "^(%S+)%s*(.-)$"
-        req = { method = method, url = url, target = target ~= "" and target or nil, headers = {} }
-      end
-    elseif l:match "^%s*$" then
-      in_body = true
-    else
-      table.insert(req.headers, expand(vim.trim(l), vars))
-    end
+  local body = {}
+  for _, i in ipairs(b.body) do
+    body[#body + 1] = ctx.lines[i]
   end
-  if not req then
+  req.body = expand(table.concat(body, "\n"), ctx, depth)
+  req.args = split_args(b.args, ctx, depth, split_args(ctx.s.file_args, ctx, depth, {}))
+  if b.name then
+    ctx.running[b.name] = nil
+  end
+  return req
+end
+
+--- Parse + expand the block containing `row` (1-based).
+function M.parse(lines, row)
+  local ctx = M.context(lines)
+  local b = M.block_at(ctx.s, row)
+  if not (b and b.req) then
     return nil, "no request under cursor"
   end
-  -- trailing blank/comment lines belong to the gap before the next ###, not the body
-  while #body > 0 and (body[#body]:match "^%s*$" or body[#body]:match "^%s*#" or body[#body]:match "^%s*//") do
-    table.remove(body)
-  end
-  req.body = expand(table.concat(body, "\n"), vars)
-  req.args = args
-  return req
+  return M.build(ctx, b)
 end
 
 --- Build the argv (and stdin) for a parsed request.
@@ -142,19 +346,17 @@ function M.command(req)
       vim.list_extend(cmd, { "-H", h })
     end
     return cmd, req.body ~= "" and req.body or nil
-  elseif HTTP_METHODS[req.method] then
-    cmd = vim.list_extend({ "curl" }, extra)
-    vim.list_extend(cmd, { "-sS", "-i", "-X", req.method, req.url })
-    for _, h in ipairs(req.headers) do
-      vim.list_extend(cmd, { "-H", h })
-    end
-    if req.body ~= "" then
-      vim.list_extend(cmd, { "--data-binary", "@-" })
-      return cmd, req.body
-    end
-    return cmd, nil
   end
-  error("unknown method: " .. req.method)
+  cmd = vim.list_extend({ "curl" }, extra)
+  vim.list_extend(cmd, { "-sS", "-i", "-X", req.method, req.url })
+  for _, h in ipairs(req.headers) do
+    vim.list_extend(cmd, { "-H", h })
+  end
+  if req.body ~= "" then
+    vim.list_extend(cmd, { "--data-binary", "@-" })
+    return cmd, req.body
+  end
+  return cmd, nil
 end
 
 local result_buf
@@ -174,14 +376,13 @@ local function show(lines)
   vim.api.nvim_buf_set_lines(result_buf, 0, -1, false, lines)
 end
 
--- Split curl -i output into header/body and pretty-print JSON bodies with jq.
--- ponytail: only the last header block is kept apart (redirects/100-continue stay inline)
+-- Header blocks as-is, JSON body pretty-printed with jq.
 local function format_http(out)
-  out = out:gsub("\r", "")
-  local head, body = out:match "^(.-\n)\n(.*)$"
-  if not head then
+  local heads, body = split_http(out)
+  if #heads == 0 then
     return out
   end
+  local head = table.concat(heads, "\n")
   if head:lower():find "content%-type:[^\n]*json" and vim.fn.executable "jq" == 1 then
     local r = vim.system({ "jq", "." }, { stdin = body }):wait()
     if r.code == 0 then
@@ -191,19 +392,21 @@ local function format_http(out)
   return head .. "\n" .. body
 end
 
-function M.send()
+---@param opts? {fresh:boolean} fresh: forget cached named responses first
+function M.send(opts)
+  if opts and opts.fresh then
+    M.responses = {}
+  end
   local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-  local okp, req, err = pcall(M.parse, lines, vim.api.nvim_win_get_cursor(0)[1])
-  if not okp then
-    req, err = nil, req
+  local ok, req, err = pcall(M.parse, lines, vim.api.nvim_win_get_cursor(0)[1])
+  if not ok then
+    err = type(req) == "table" and ("request `%s` depends on itself"):format(req.cycle) or req
+    req = nil
   end
   if not req then
-    return vim.notify("gooseman: " .. err, vim.log.levels.WARN)
+    return vim.notify("gooseman: " .. tostring(err), vim.log.levels.WARN)
   end
-  local ok, cmd, stdin = pcall(M.command, req)
-  if not ok then
-    return vim.notify("gooseman: " .. cmd, vim.log.levels.WARN)
-  end
+  local cmd, stdin = M.command(req)
   if vim.fn.executable(cmd[1]) == 0 then
     return vim.notify("gooseman: " .. cmd[1] .. " not installed", vim.log.levels.ERROR)
   end
@@ -223,6 +426,9 @@ function M.send()
   vim.system(cmd, { stdin = stdin, text = true }, function(r)
     vim.schedule(function()
       local ms = math.floor((vim.uv.hrtime() - start) / 1e6)
+      if req.name and r.code == 0 then
+        M.responses[req.name] = M.to_response(req.method, r.stdout)
+      end
       local out = r.stdout .. (r.stderr ~= "" and ("\n" .. r.stderr) or "")
       if req.method ~= "GRPC" then
         out = format_http(out)

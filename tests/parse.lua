@@ -78,4 +78,21 @@ assert(r.body == "k=v", r.body)
 assert(r.url == "http://h/goose", r.url)
 cmd = p.command(r)
 assert(cmd[1] == "curl" and cmd[2] == "-u" and cmd[3] == "a:b", vim.inspect(cmd))
+
+-- named responses: file-wide header from a cached login; login itself never uses its own token
+p.responses = { login = p.to_response("POST", 'HTTP/1.1 200 OK\r\nX-Sid: 7\r\n\r\n{"token":"t","items":[{"id":5}]}') }
+lines = {
+  "# @header Authorization: Bearer {{login.body.token}}",
+  "### login",
+  "# @name login",
+  "POST http://h/login",
+  "### use",
+  "GET http://h/x/{{login.body.items.0.id}}?sid={{login.headers.x-sid}}&s={{login.status}}",
+}
+r = assert(p.parse(lines, 4))
+assert(#r.headers == 0, vim.inspect(r.headers))
+r = assert(p.parse(lines, 6))
+assert(r.headers[1] == "Authorization: Bearer t", vim.inspect(r.headers))
+assert(r.url == "http://h/x/5?sid=7&s=200", r.url)
+assert(not pcall(p.parse, { "### a", "# @name a", "GET http://h/{{a.body.x}}" }, 3), "self reference must fail")
 print "ok"
