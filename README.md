@@ -375,6 +375,8 @@ schema's examples. JSON specs work out of the box; YAML needs `yq`.
 
 ## ✂️ Snippets
 
+![building a file from snippets: auth-login, post-json, expect-ok, then :Honk all](demo/snippets.gif)
+
 Snippets come from the built-in LSP, so blink.cmp or nvim-cmp expand them with no snippet plugin needed.
 Type the prefix at the start of a line:
 
