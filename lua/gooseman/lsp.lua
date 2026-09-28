@@ -36,6 +36,8 @@ local DIRECTIVES = {
   args = "raw flags for curl/grpcurl/websocat",
   header = "(before the first ###) header added to every request",
   expect = "assert on the response: <path> <op> [value], e.g. status == 200",
+  stream = "show the response live in a terminal (SSE, streaming APIs)",
+  each = "send once per row of a data file: users.csv (header row = variable names) or users.json",
 }
 
 local K = vim.lsp.protocol.CompletionItemKind
@@ -523,10 +525,22 @@ function M.diagnostics(lines, uri)
       source = "gooseman",
     }
   end
+  local columns = {} -- row -> first row of its block's @each file (its keys are defined there)
+  for _, b in ipairs(s.blocks) do
+    if b.each then
+      local ok, rows = pcall(g.rows, b, vim.uri_to_fname(uri))
+      if not ok then
+        add(b.each.line, 0, #lines[b.each.line], rows, vim.lsp.protocol.DiagnosticSeverity.Error)
+      end
+      for i = b.first, b.last do
+        columns[i] = ok and rows[1] or {}
+      end
+    end
+  end
   for row, l in ipairs(lines) do
     if not l:match "^%s*#" or l:match "^%s*#%s*@" then
       for _, r in ipairs(g.refs(l)) do
-        if not kind_of(s, r.ref) then
+        if not kind_of(s, r.ref) and not (columns[row] or {})[r.ref] then
           add(row, r.s - 1, r.e, ("undefined `%s` (not a @var, named request or env var)"):format(r.ref))
         end
       end

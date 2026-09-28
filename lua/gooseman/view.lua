@@ -1,6 +1,7 @@
 -- The response window: status + checks, folded headers, highlighted JSON body.
 -- Keys: q close · yr copy {{name.body.path}} of the value under the cursor
 --       R raw/pretty · o open a binary body in the system viewer · :Honk jq <filter>
+-- Also :Honk save [file] · :Honk history · :Honk diff
 
 local M = {}
 
@@ -15,6 +16,8 @@ local TEXTY = { "json", "text/", "xml", "javascript", "html", "form", "graphql",
 local EXT = {
   ["image/png"] = "png", ["image/jpeg"] = "jpg", ["image/gif"] = "gif", ["image/webp"] = "webp",
   ["application/pdf"] = "pdf", ["application/zip"] = "zip", ["audio/mpeg"] = "mp3", ["video/mp4"] = "mp4",
+  ["application/json"] = "json", ["text/html"] = "html", ["text/plain"] = "txt", ["application/xml"] = "xml",
+  ["text/csv"] = "csv",
 }
 
 local function is_binary(ct, body)
@@ -28,6 +31,19 @@ local function is_binary(ct, body)
     end
   end
   return ct:match "^image/" or ct:match "^audio/" or ct:match "^video/" or ct:find "pdf" or ct:find "octet%-stream" or ct:find "zip"
+end
+
+--- The response body, byte-exact (headers stripped for HTTP).
+function M.body(res)
+  if res.resp.status == 0 then -- grpcurl / websocat: stdout is the body
+    return res.r.stdout
+  end
+  local _, body = require("gooseman").split_http(res.r.stdout)
+  return body
+end
+
+local function content_type(res)
+  return (res.resp.headers["content-type"] or ""):match "^[^;%s]+" or ""
 end
 
 local function size(n)
@@ -128,6 +144,11 @@ local function draw()
     res.retried and (", retried after refreshing " .. table.concat(res.retried, ", ")) or "",
     st.filter and (", jq " .. st.filter) or ""
   ), ok and "DiagnosticOk" or "DiagnosticError")
+  local t = res.timing
+  if t then
+    add(("  dns %d · connect %d%s · server %d · download %d  = %d ms"):format(
+      t.dns, t.connect, t.tls and (" · tls " .. t.tls) or "", t.server, t.download, t.total), "Comment")
+  end
   for _, c in ipairs(res.checks) do
     if c.text ~= "succeeds" then -- the default check is implied by the status line
       add((c.ok and "  ✓ " or "  ✗ ") .. c.text .. (c.ok and "" or ("   (got " .. tostring(c.got) .. ")")),
@@ -221,14 +242,108 @@ function M.open_binary()
   if not st then
     return
   end
-  local _, body = require("gooseman").split_http(st.res.r.stdout)
-  local ct = (st.res.resp.headers["content-type"] or ""):match "^[^;%s]+" or ""
-  local path = vim.fn.tempname() .. "." .. (EXT[ct] or "bin")
+  local path = vim.fn.tempname() .. "." .. (EXT[content_type(st.res)] or "bin")
   local f = assert(io.open(path, "wb"))
-  f:write(body)
+  f:write(M.body(st.res))
   f:close()
   vim.ui.open(path)
   vim.notify("gooseman: saved " .. path)
+end
+
+--- Write the response body (exact bytes) to `file`; no file = ask, suggesting a name from the URL.
+function M.save(file)
+  local st = M.state
+  if not st then
+    return vim.notify("gooseman: no response to save", vim.log.levels.WARN)
+  end
+  local function write(p)
+    p = vim.fn.expand(p)
+    local f, err = io.open(p, "wb")
+    if not f then
+      return vim.notify("gooseman: " .. err, vim.log.levels.ERROR)
+    end
+    f:write(M.body(st.res))
+    f:close()
+    vim.notify("gooseman: saved " .. p)
+  end
+  if file and file ~= "" then
+    return write(file)
+  end
+  local last = (st.res.req.url:match "^[^?#]*" or ""):match "([^/]+)$" or ""
+  local default = last:match "%.%w+$" and last or ("response." .. (EXT[content_type(st.res)] or "txt"))
+  vim.ui.input({ prompt = "save body to: ", default = default, completion = "file" }, function(p)
+    if p and p ~= "" then
+      write(p)
+    end
+  end)
+end
+
+local function source_of(e)
+  local nr = vim.fn.bufnr(e.path)
+  return { bufnr = nr ~= -1 and nr or nil, req_text = e.req_text }
+end
+
+--- Pick an earlier response (any request) and show it.
+function M.history()
+  local h = require("gooseman").history
+  if #h == 0 then
+    return vim.notify("gooseman: nothing sent yet", vim.log.levels.WARN)
+  end
+  vim.ui.select(h, {
+    prompt = "honk: history",
+    format_item = function(e)
+      local res = e.res
+      local ok = true
+      for _, c in ipairs(res.checks) do
+        ok = ok and c.ok
+      end
+      local status = res.resp.status > 0 and res.resp.status or ("exit " .. res.r.code)
+      return ("%s  %s %-8s %6dms  %s"):format(os.date("%H:%M:%S", e.at), ok and "✓" or "✗", status, res.ms, e.req_text)
+    end,
+  }, function(e)
+    if e then
+      M.render(e.res, source_of(e))
+    end
+  end)
+end
+
+-- status + body, JSON sorted and pretty (jq -S) so diffs show real changes
+local function diff_text(res)
+  local body = M.body(res):gsub("\r", "")
+  if type(res.resp.body) == "table" and vim.fn.executable "jq" == 1 then
+    local r = vim.system({ "jq", "-S", "." }, { stdin = body, text = true }):wait()
+    body = r.code == 0 and r.stdout or body
+  end
+  local status = res.resp.status > 0 and ("status " .. res.resp.status) or ("exit " .. res.r.code)
+  return vim.split(status .. "\n\n" .. body:gsub("\n$", ""), "\n")
+end
+
+--- Diff the response on screen against the previous response of the same request, in a new tab.
+function M.diff()
+  local st = M.state
+  if not st then
+    return vim.notify("gooseman: no response to diff", vim.log.levels.WARN)
+  end
+  local h, cur = require("gooseman").history, nil
+  for _, e in ipairs(h) do
+    if cur and e.path == cur.path and e.req_text == cur.req_text then
+      vim.cmd "tabnew"
+      for i, x in ipairs { e, cur } do
+        if i == 2 then
+          vim.cmd "rightbelow vnew"
+        end
+        local b = api.nvim_get_current_buf()
+        vim.bo[b].buftype, vim.bo[b].bufhidden = "nofile", "wipe"
+        api.nvim_buf_set_lines(b, 0, -1, false, diff_text(x.res))
+        vim.bo[b].modifiable = false
+        vim.wo.winbar = ("%s  %s"):format(os.date("%H:%M:%S", x.at), x.req_text)
+        vim.cmd "diffthis"
+      end
+      return
+    end
+    cur = cur or (e.res == st.res and e) or nil
+  end
+  vim.notify("gooseman: no earlier response of this request", vim.log.levels.WARN)
 end
 
 --- Dotted path of the JSON value on `row`, from jq's pretty output starting at `first`.

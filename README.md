@@ -38,6 +38,7 @@ The goose doesn't reinvent anything. It hands each request to a tool you already
 | [`websocat`](https://github.com/vi/websocat)            | `WS` requests                               | for WebSocket         |
 | [`jq`](https://jqlang.github.io/jq)                     | pretty-printing JSON, `:Honk jq`            | optional              |
 | `git`                                                   | faster file listing for `:Honk pick`        | optional              |
+| [`yq`](https://github.com/mikefarah/yq)                 | YAML specs in `:Honk openapi`               | optional              |
 
 Install only what you use. `:checkhealth gooseman` tells you what's missing.
 
@@ -66,6 +67,10 @@ No `setup()` needed.
 | `:Honk last`            | re-send the last request, from any buffer (handy on a global key while you edit server code) |
 | `:Honk pick`            | pick any request in the project's `.http` files (`vim.ui.select`, so your picker) and jump to it |
 | `:Honk jq [filter]`     | filter the response window through jq; no filter clears it                  |
+| `:Honk save [file]`     | write the response body (exact bytes) to a file; no file = prompt with a name from the URL |
+| `:Honk history`         | pick any of the last 50 responses and show it again                         |
+| `:Honk diff`            | diff the response on screen against the previous one of the same request, in a new tab |
+| `:Honk openapi <file\|url>` | generate a `.http` file from an OpenAPI 3 / Swagger 2 spec (JSON, or YAML with yq) |
 | `]r` / `[r`             | next / previous request in a `.http` buffer                                 |
 
 Statusline: `require("gooseman").statusline()` returns `🪿 dev` while an environment is active.
@@ -73,6 +78,7 @@ Statusline: `require("gooseman").statusline()` returns `🪿 dev` while an envir
 ## 🪟 The response window
 
 - The status line turns green or red depending on your `@expect`s.
+- Under it, where the time went: `dns 2 · connect 3 · tls 25 · server 40 · download 5  = 75 ms` (HTTP only).
 - Headers fold closed under their `HTTP/1.1 200 OK` line: `zo` opens them, `zc` closes them.
 - JSON bodies are pretty-printed by jq and highlighted.
 - `q` closes the window, and `R` toggles the raw output.
@@ -116,6 +122,11 @@ Content-Type: application/json
   (`-u`, `--cert`, `-insecure`, `-proto`, `--basic-auth`, …). Split on whitespace, no quoting.
 - **Named requests**: `# @name login` lets any request use its response:
   `{{login.body.token}}`, `{{login.headers.Set-Cookie}}`, `{{login.status}}`. See [reusing auth](#️-reusing-auth-across-requests).
+- **Streaming**: `# @stream` (or an `Accept: text/event-stream` header) shows the response live in a terminal
+  split, for Server-Sent Events, LLM APIs and log tails. Ctrl-C stops it.
+- **Data-driven**: `# @each users.csv` sends the request once per row, with the columns as variables
+  (`{{user}}`, `{{age}}`). The CSV's first row names the columns (no quoting, so use a `.json` array of objects
+  for values with commas). The path is relative to the `.http` file. `:Honk` and `:Honk all` report each row.
 - **File-wide settings**: before the first `###`, `# @header K: V` adds a header to every request
   and `# @args ...` adds flags to every request. A request's own header with the same name wins.
 
@@ -308,6 +319,23 @@ POST {{host}}/login
 
 `:Honk` shows the ✓/✗ lines above the response. `:Honk all` runs the whole file in order, so logins and
 chains work, and prints a report. Failures go to the quickfix list. See [`examples/tests.http`](examples/tests.http).
+
+Asserts work on gRPC and WebSocket too. In `:Honk all`, a `WS` request with `@expect` sends its body, waits up to
+10s for one reply and checks that (`body.<key>` if it's JSON). `WS` requests without `@expect` and `@stream`
+requests are skipped.
+
+### In CI
+
+Headless, `:Honk all` prints the report and exits `0` when everything passed, `1` when something failed:
+
+```sh
+nvim --headless api.http +"Honk env ci" +"Honk all"
+# without your config:
+nvim --headless -u NONE --cmd "set rtp+=path/to/gooseman.nvim" +"runtime plugin/gooseman.lua" api.http +"Honk all"
+```
+
+Don't add `+q`: the run is async and quits by itself. A guarded environment (`"$confirm": true`, or a
+prod-named one) asks before sending, so use an unguarded one in CI.
 
 ## 📋 curl in and out
 

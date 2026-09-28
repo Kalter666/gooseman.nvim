@@ -222,4 +222,61 @@ assert(view.json_path(jl, 1, 6) == "user.tags.1")
 assert(view.json_path(jl, 1, 9) == "user.tags") -- closing ] names its array
 assert(view.json_path(jl, 1, 11) == nil) -- "odd key" can't be a {{ref}} path
 assert(view.json_path(jl, 1, 1) == "")
+
+-- curl -w timing: cumulative seconds -> phases in ms, marker line stripped from stderr
+local t, rest = p.timing "warn\n@@gooseman-timing 0.002 0.005 0.030 0.070 0.075\n"
+assert(t.dns == 2 and t.connect == 3 and t.tls == 25 and t.server == 40 and t.download == 5 and t.total == 75, vim.inspect(t))
+assert(rest == "warn", vim.inspect(rest))
+t = p.timing "@@gooseman-timing 0.001 0.002 0 0.010 0.011\n"
+assert(t.tls == nil and t.server == 8, vim.inspect(t))
+assert(p.timing "" == nil)
+
+-- @stream: directive, or an event-stream Accept header; @each rows from CSV and JSON
+local dir = vim.fn.tempname()
+vim.fn.mkdir(dir, "p")
+vim.fn.writefile({ "user, id", "ann,1", "", "bob, 2" }, dir .. "/u.csv")
+vim.fn.writefile({ '[{"user":"ann","n":1,"x":null},{"user":"bob","tags":["a"]}]' }, dir .. "/u.json")
+local s2 = p.scan(vim.split([[
+### a
+# @stream
+GET http://x/
+### b
+GET http://x/events
+Accept: text/event-stream
+### c
+# @each u.csv
+GET http://x/{{user}}
+### d
+# @each u.json
+GET http://x/]], "\n"))
+assert(s2.blocks[1].stream and s2.blocks[2].stream and not s2.blocks[3].stream)
+local rows = p.rows(s2.blocks[3], dir .. "/f.http")
+assert(#rows == 2 and rows[2].user == "bob" and rows[2].id == "2", vim.inspect(rows))
+rows = p.rows(s2.blocks[4], dir .. "/f.http")
+assert(rows[1].n == "1" and rows[1].x == nil and rows[2].tags == '["a"]', vim.inspect(rows))
+local ctx = p.context(vim.split("### c\nGET http://x/{{user}}", "\n"))
+ctx.resolved = { user = "ann" }
+assert(p.build(ctx, ctx.s.blocks[1]).url == "http://x/ann")
+
+-- OpenAPI -> .http
+local http = require("gooseman.openapi").to_http {
+  info = { title = "geese" },
+  servers = { { url = "http://api/v1/" } },
+  paths = {
+    ["/geese/{id}"] = {
+      parameters = { { name = "id", ["in"] = "path", required = true } },
+      get = { summary = "get a goose", parameters = { { ["$ref"] = "#/components/parameters/Q" } } },
+      put = { requestBody = { content = { ["application/json"] = { schema = { ["$ref"] = "#/components/schemas/Goose" } } } } },
+    },
+  },
+  components = {
+    parameters = { Q = { name = "verbose", ["in"] = "query", required = true } },
+    schemas = { Goose = { type = "object", properties = { name = { type = "string", example = "honk" } } } },
+  },
+}
+local text = table.concat(http, "\n")
+assert(text:find("@host = http://api/v1\n", 1, true), text)
+assert(text:find("### get a goose\nGET {{host}}/geese/{{id}}?verbose={{verbose}}", 1, true), text)
+assert(text:find("PUT {{host}}/geese/{{id}}\nContent-Type: application/json\n", 1, true), text)
+assert(text:find('"name": "honk"', 1, true) or text:find('"name":"honk"', 1, true), text)
 print "ok"

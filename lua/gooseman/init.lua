@@ -9,6 +9,8 @@
 --   # @args ...     raw flags for the tool (mTLS, -proto, -k, cookie jars, ...)
 --   # @header K: V  (before the first ###) header added to every request in the file
 --   # @expect ...   assertion on the response (see expect.lua); `:Honk all` runs the file as a test
+--   # @stream       show the response live in a terminal (SSE, logs); implied by Accept: text/event-stream
+--   # @each f.csv   send once per row of a CSV (header row = variable names) or JSON array of objects
 -- Before the first ###, @args also applies to every request.
 -- Environments (gooseman.json) supply variables too, see env.lua.
 
@@ -76,6 +78,10 @@ function M.scan(lines)
           table.insert(b.preamble and s.file_args or b.args, { text = dv, line = i })
         elseif d == "expect" then
           table.insert(b.expects, { text = dv, line = i })
+        elseif d == "stream" then
+          b.stream = true
+        elseif d == "each" then
+          b.each = { text = dv, line = i }
         elseif d == "header" and b.preamble then
           table.insert(s.file_headers, { text = dv, line = i })
         elseif is_comment(l) then
@@ -95,6 +101,9 @@ function M.scan(lines)
     -- trailing blank/comment lines belong to the gap before the next ###, not the body
     while #b.body > 0 and (lines[b.body[#b.body]]:match "^%s*$" or is_comment(lines[b.body[#b.body]])) do
       table.remove(b.body)
+    end
+    for _, h in ipairs(b.headers) do
+      b.stream = b.stream or h.text:lower():match "^accept:.*text/event%-stream" ~= nil
     end
     table.insert(s.blocks, b)
   end
@@ -168,7 +177,7 @@ local split_http = M.split_http
 function M.to_response(method, stdout)
   local resp = { status = 0, headers = {} }
   local body = stdout
-  if method ~= "GRPC" then
+  if method ~= "GRPC" and method ~= "WS" then
     local heads
     heads, body = split_http(stdout)
     local last = heads[#heads] or ""
@@ -379,8 +388,12 @@ function M.parse(lines, row, path)
 end
 
 --- Build the argv (and stdin) for a parsed request.
+--- opts.stream: curl for a terminal (-N, body inline since stdin is the pty)
+--- opts.once: websocat sends the body, waits for one reply and exits (for @expect)
+---@param opts? {stream:boolean, once:boolean}
 ---@return string[] cmd, string? stdin
-function M.command(req)
+function M.command(req, opts)
+  opts = opts or {}
   local cmd
   local extra = req.args or {}
   if req.method == "GRPC" then
@@ -406,6 +419,9 @@ function M.command(req)
   elseif req.method == "WS" then
     -- URL before -H: websocat's -H is multi-value and would swallow a trailing URL
     cmd = vim.list_extend({ "websocat" }, extra)
+    if opts.once then
+      vim.list_extend(cmd, { "-n", "-1" })
+    end
     table.insert(cmd, req.url)
     for _, h in ipairs(req.headers) do
       vim.list_extend(cmd, { "-H", h })
@@ -416,6 +432,13 @@ function M.command(req)
   vim.list_extend(cmd, { "-sS", "-i", "-X", req.method, req.url })
   for _, h in ipairs(req.headers) do
     vim.list_extend(cmd, { "-H", h })
+  end
+  if opts.stream then
+    table.insert(cmd, "-N")
+    if req.body ~= "" then
+      vim.list_extend(cmd, { "--data-raw", req.body })
+    end
+    return cmd, nil
   end
   if req.body ~= "" then
     vim.list_extend(cmd, { "--data-binary", "@-" })
@@ -438,28 +461,64 @@ local function errmsg(e)
   return type(e) == "table" and ("request `%s` depends on itself"):format(e.cycle) or tostring(e)
 end
 
+--- Every finished send, newest first: {res, path, req_text, at}. For `:Honk history` / `:Honk diff`.
+M.history = {}
+M.HISTORY_MAX = 50
+
+-- curl -w, to stderr so the body stays byte-exact; parsed and stripped in run()
+local TIMING_MARK = "@@gooseman-timing"
+local TIMING = "%{stderr}\n" .. TIMING_MARK .. " %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}\n"
+
+--- curl's cumulative times (seconds) -> phase durations in ms.
+function M.timing(stderr)
+  local t = vim.tbl_map(tonumber, vim.split(stderr:match(vim.pesc(TIMING_MARK) .. " ([^\n]*)") or "", " ", { trimempty = true }))
+  if #t < 5 then
+    return nil, stderr
+  end
+  local dns, conn, tls, ttfb, total = unpack(t)
+  local ready = tls > 0 and tls or conn
+  local ms = function(x)
+    return math.floor(x * 1000 + 0.5)
+  end
+  local phases = { dns = ms(dns), connect = ms(conn - dns), tls = tls > 0 and ms(tls - conn) or nil,
+    server = ms(ttfb - ready), download = ms(total - ttfb), total = ms(total) }
+  return phases, (stderr:gsub("\n?" .. vim.pesc(TIMING_MARK) .. "[^\n]*\n?", ""))
+end
+
 --- Build and run one block asynchronously; `cb(res)` gets
---- {req, r, resp, ms, retried, checks} or {err}.
+--- {req, r, resp, ms, retried, checks, timing} or {err}. `opts.vars` presets variables (an @each row).
+--- WS runs one-shot: send the body, wait for one reply (10s) and treat it as the response body.
 --- A 401 on a request that used cached named responses (a login token, say)
 --- forgets those, re-runs them and retries once. To go easy on rate limits:
 --- 401 only (403 means forbidden, a fresh token won't help), each named request is
 --- refreshed at most once per REFRESH_COOLDOWN seconds, and
 --- `vim.g.gooseman_auto_refresh = false` turns it off.
-function M.run(lines, b, path, cb)
+function M.run(lines, b, path, cb, opts)
+  opts = opts or {}
   local function attempt(retried)
     local ctx = M.context(lines, path)
+    ctx.resolved = vim.deepcopy(opts.vars or {})
     local ok, req = pcall(M.build, ctx, b)
     if not ok then
       return cb { err = errmsg(req) }
     end
-    local cmd, stdin = M.command(req)
+    local ws = req.method == "WS"
+    local cmd, stdin = M.command(req, { once = ws })
     if vim.fn.executable(cmd[1]) == 0 then
       return cb { err = cmd[1] .. " not installed" }
     end
+    local http = cmd[1] == "curl"
+    if http then
+      vim.list_extend(cmd, { "-w", TIMING })
+    end
     local start = vim.uv.hrtime()
     -- no `text`: keep bytes exact for binary bodies; stderr may still carry \r
-    vim.system(cmd, { stdin = stdin }, vim.schedule_wrap(function(r)
+    vim.system(cmd, { stdin = stdin, timeout = ws and 10000 or nil }, vim.schedule_wrap(function(r)
+      local timing
       r.stdout, r.stderr = r.stdout or "", (r.stderr or ""):gsub("\r", "")
+      if http then
+        timing, r.stderr = M.timing(r.stderr)
+      end
       local resp = M.to_response(req.method, r.stdout)
       local stale = not retried and resp.status == 401 and vim.g.gooseman_auto_refresh ~= false
         and vim.tbl_filter(function(name)
@@ -478,16 +537,24 @@ function M.run(lines, b, path, cb)
       local checks = expect.check(b.expects, resp, r.code, M.field, function(v)
         return M.expand(v, ctx)
       end)
-      cb {
-        req = req, r = r, resp = resp, retried = retried, checks = checks,
+      local res = {
+        req = req, r = r, resp = resp, retried = retried, checks = checks, timing = timing,
         ms = math.floor((vim.uv.hrtime() - start) / 1e6),
       }
+      table.insert(M.history, 1, { res = res, path = path, req_text = b.req.text, at = os.time() })
+      M.history[M.HISTORY_MAX + 1] = nil
+      cb(res)
     end))
   end
   attempt(false)
 end
 
 local marks = vim.api.nvim_create_namespace "gooseman_results"
+
+-- "200" for HTTP, "exit 0" for tools without a status (grpcurl, websocat)
+local function status_of(res)
+  return res.resp.status > 0 and tostring(res.resp.status) or ("exit " .. res.r.code)
+end
 
 -- "⏳" now, "✓ 200 · 45ms · 14:03" when done, on the block's ### line (moves with edits)
 local function mark(bufnr, b, id, res)
@@ -498,7 +565,7 @@ local function mark(bufnr, b, id, res)
     for _, c in ipairs(res.checks or {}) do
       ok = ok and c.ok
     end
-    local what = res.err and "error" or (res.req.method == "GRPC" and ("exit " .. res.r.code) or tostring(res.resp.status))
+    local what = res.err and "error" or status_of(res)
     text = ("%s %s · %s · %s"):format(ok and "✓" or "✗", what, res.ms and (res.ms .. "ms") or "-", os.date "%H:%M")
     hl = ok and "DiagnosticOk" or "DiagnosticError"
   end
@@ -516,28 +583,153 @@ end
 --- Where `:Honk last` goes: {bufnr, path, req_text}
 M.last_sent = nil
 
---- Send one block of `bufnr` (WS opens a terminal). Respects the environment's confirm guard.
+--- Rows of a block's `# @each` file (relative to the .http file): a JSON array of objects,
+--- or CSV whose header row names the variables.
+-- ponytail: CSV split on commas, no quoting; use a .json file for values with commas
+function M.rows(b, path)
+  local file = b.each.text
+  if not file:match "^[/~]" then
+    file = vim.fs.joinpath(path ~= "" and vim.fs.dirname(path) or vim.fn.getcwd(), file)
+  end
+  local ok, lines = pcall(vim.fn.readfile, vim.fn.expand(file))
+  if not ok or #lines == 0 then
+    error("@each: can't read " .. file, 0)
+  end
+  local rows = {}
+  if file:match "%.json$" then
+    local list = vim.json.decode(table.concat(lines, "\n"))
+    for _, o in ipairs(type(list) == "table" and list or {}) do
+      local row = {}
+      for k, v in pairs(o) do
+        row[k] = type(v) == "table" and vim.json.encode(v) or v ~= vim.NIL and tostring(v) or nil
+      end
+      rows[#rows + 1] = row
+    end
+    return rows
+  end
+  local keys = vim.tbl_map(vim.trim, vim.split(lines[1], ","))
+  for i = 2, #lines do
+    if lines[i]:match "%S" then
+      local row, vals = {}, vim.split(lines[i], ",")
+      for j, k in ipairs(keys) do
+        row[k] = vim.trim(vals[j] or "")
+      end
+      rows[#rows + 1] = row
+    end
+  end
+  return rows
+end
+
+-- {b, vars, label} per send: one, or one per @each row
+local function jobs_for(b, path)
+  local name = b.title ~= "" and b.title or b.req.text
+  if not b.each then
+    return { { b = b, label = name } }
+  end
+  local out = {}
+  for i, row in ipairs(M.rows(b, path)) do
+    out[#out + 1] = { b = b, vars = row, label = ("%s [%d]"):format(name, i) }
+  end
+  return out
+end
+
+-- Run jobs one after another, marks on their ### lines; report + quickfix at the end.
+-- `done(failed, report)` runs after.
+local function run_jobs(bufnr, lines, path, jobs, done)
+  local report, qf, failed, i = {}, {}, 0, 0
+  local started = vim.uv.hrtime()
+
+  local function finish()
+    local ms = math.floor((vim.uv.hrtime() - started) / 1e6)
+    local head = ("honk: %d passed, %d failed  (%dms%s)"):format(
+      #jobs - failed, failed, ms, env.active and (", env " .. env.active) or ""
+    )
+    table.insert(report, 1, head)
+    table.insert(report, 2, "")
+    view.show(report)
+    vim.fn.setqflist({}, "r", { title = "gooseman", items = qf })
+    if done then
+      return done(failed, report)
+    end
+    vim.notify("gooseman: " .. head, failed > 0 and vim.log.levels.WARN or vim.log.levels.INFO)
+    pcall(function()
+      require("gooseman.lsp").refresh()
+    end)
+  end
+
+  local function step()
+    i = i + 1
+    local job = jobs[i]
+    if not job then
+      return finish()
+    end
+    local b = job.b
+    view.show { ("honk: %d/%d  %s"):format(i, #jobs, job.label) }
+    local id = vim.api.nvim_buf_is_loaded(bufnr) and mark(bufnr, b)
+    M.run(lines, b, path, function(res)
+      if id and vim.api.nvim_buf_is_loaded(bufnr) then
+        mark(bufnr, b, id, res)
+      end
+      local bad = {}
+      if res.err then
+        bad[1] = res.err
+      else
+        for _, c in ipairs(res.checks) do
+          if not c.ok then
+            bad[#bad + 1] = c.text .. "   (got " .. tostring(c.got) .. ")"
+          end
+        end
+      end
+      report[#report + 1] = ("%s %s   %s  %s"):format(#bad == 0 and "✓" or "✗", job.label,
+        res.resp and status_of(res) or "-", res.ms and (res.ms .. "ms") or "")
+      for _, m in ipairs(bad) do
+        report[#report + 1] = "    " .. m
+        qf[#qf + 1] = { bufnr = bufnr, lnum = b.req.line, text = job.label .. ": " .. m }
+      end
+      if #bad > 0 then
+        failed = failed + 1
+      end
+      step()
+    end, { vars = job.vars })
+  end
+  step()
+end
+
+-- WS, or a streamed HTTP response: live in a terminal split
+local function send_terminal(lines, b, path)
+  local ok, req = pcall(M.build, M.context(lines, path), b)
+  if not ok then
+    return vim.notify("gooseman: " .. errmsg(req), vim.log.levels.WARN)
+  end
+  local cmd, stdin = M.command(req, { stream = true })
+  if vim.fn.executable(cmd[1]) == 0 then
+    return vim.notify("gooseman: " .. cmd[1] .. " not installed", vim.log.levels.ERROR)
+  end
+  vim.cmd "botright split"
+  local job = vim.fn.jobstart(cmd, { term = true })
+  if stdin then
+    vim.fn.chansend(job, stdin .. "\n")
+  end
+  vim.cmd "startinsert"
+end
+
+--- Send one block of `bufnr` (WS / @stream open a terminal, @each runs every row).
+--- Respects the environment's confirm guard.
 function M.send_block(bufnr, lines, b, path)
   if not env.confirm(path, b.req.text) then
     return
   end
   M.last_sent = { bufnr = bufnr, path = path, req_text = b.req.text }
 
-  if b.req.text:match "^WS%s" then
-    local ok, req = pcall(M.build, M.context(lines, path), b)
+  if b.req.text:match "^WS%s" or b.stream then
+    return send_terminal(lines, b, path)
+  end
+  if b.each then
+    local ok, jobs = pcall(jobs_for, b, path)
     if not ok then
-      return vim.notify("gooseman: " .. errmsg(req), vim.log.levels.WARN)
+      return vim.notify("gooseman: " .. jobs, vim.log.levels.WARN)
     end
-    local cmd, stdin = M.command(req)
-    if vim.fn.executable(cmd[1]) == 0 then
-      return vim.notify("gooseman: websocat not installed", vim.log.levels.ERROR)
-    end
-    vim.cmd "botright split"
-    local job = vim.fn.jobstart(cmd, { term = true })
-    if stdin then
-      vim.fn.chansend(job, stdin .. "\n")
-    end
-    return vim.cmd "startinsert"
+    return run_jobs(bufnr, lines, path, jobs)
   end
 
   view.show { b.req.text .. "  …" }
@@ -638,72 +830,35 @@ function M.pick()
   end)
 end
 
---- Run every HTTP/gRPC request in the buffer top to bottom (WS skipped); report + quickfix.
+--- Run every request in the buffer top to bottom (each @each row too; @stream and WS without
+--- @expect skipped); report + quickfix. Headless (`nvim --headless f.http +"Honk all"`) prints
+--- the report and exits non-zero on failure, for CI.
 function M.send_all(opts)
   if opts and opts.fresh then
     M.responses = {}
   end
   local lines, _, path = current()
   local bufnr = vim.api.nvim_get_current_buf()
-  local blocks = vim.tbl_filter(function(b)
-    return b.req and not b.req.text:match "^WS%s"
-  end, M.scan(lines).blocks)
-  if not env.confirm(path, #blocks .. " requests") then
-    return
-  end
-  local report, qf, failed, i = {}, {}, 0, 0
-  local started = vim.uv.hrtime()
-  vim.api.nvim_buf_clear_namespace(bufnr, marks, 0, -1)
-
-  local function finish()
-    local ms = math.floor((vim.uv.hrtime() - started) / 1e6)
-    local head = ("honk all: %d passed, %d failed  (%dms%s)"):format(
-      #blocks - failed, failed, ms, env.active and (", env " .. env.active) or ""
-    )
-    view.show(vim.list_extend({ head, "" }, report))
-    vim.fn.setqflist({}, "r", { title = "gooseman", items = qf })
-    vim.notify("gooseman: " .. head, failed > 0 and vim.log.levels.WARN or vim.log.levels.INFO)
-    pcall(function()
-      require("gooseman.lsp").refresh()
-    end)
-  end
-
-  local function step()
-    i = i + 1
-    local b = blocks[i]
-    if not b then
-      return finish()
+  local ci = #vim.api.nvim_list_uis() == 0
+  local jobs = {}
+  for _, b in ipairs(M.scan(lines).blocks) do
+    if b.req and not b.stream and not (b.req.text:match "^WS%s" and #b.expects == 0) then
+      local ok, js = pcall(jobs_for, b, path)
+      if not ok then
+        vim.notify("gooseman: " .. js, vim.log.levels.ERROR)
+        return ci and vim.cmd "cquit 2"
+      end
+      vim.list_extend(jobs, js)
     end
-    view.show { ("honk all: %d/%d  %s"):format(i, #blocks, b.req.text) }
-    local id = vim.api.nvim_buf_is_loaded(bufnr) and mark(bufnr, b)
-    M.run(lines, b, path, function(res)
-      if id and vim.api.nvim_buf_is_loaded(bufnr) then
-        mark(bufnr, b, id, res)
-      end
-      local name = b.title ~= "" and b.title or b.req.text
-      local bad = {}
-      if res.err then
-        bad[1] = res.err
-      else
-        for _, c in ipairs(res.checks) do
-          if not c.ok then
-            bad[#bad + 1] = c.text .. "   (got " .. tostring(c.got) .. ")"
-          end
-        end
-      end
-      local status = res.resp and (res.req.method == "GRPC" and ("exit " .. res.r.code) or res.resp.status) or "-"
-      report[#report + 1] = ("%s %s   %s  %s"):format(#bad == 0 and "✓" or "✗", name, status, res.ms and (res.ms .. "ms") or "")
-      for _, m in ipairs(bad) do
-        report[#report + 1] = "    " .. m
-        qf[#qf + 1] = { bufnr = bufnr, lnum = b.req.line, text = name .. ": " .. m }
-      end
-      if #bad > 0 then
-        failed = failed + 1
-      end
-      step()
-    end)
   end
-  step()
+  if not env.confirm(path, #jobs .. " requests") then
+    return ci and vim.cmd "cquit 2"
+  end
+  vim.api.nvim_buf_clear_namespace(bufnr, marks, 0, -1)
+  run_jobs(bufnr, lines, path, jobs, ci and function(failed, report)
+    io.stdout:write(table.concat(report, "\n") .. "\n")
+    vim.cmd(failed > 0 and "cquit 1" or "qall!")
+  end)
 end
 
 --- Copy the request under the cursor as a shell command.
