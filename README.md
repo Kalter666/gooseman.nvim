@@ -28,8 +28,18 @@ The goose doesn't reinvent anything. It hands each request to a tool you already
 
 ## 📦 Install
 
-Needs Neovim 0.10+ and whichever tools you use: `curl`, `grpcurl`, `websocat`, `jq` (optional).
-`:checkhealth gooseman` tells you what's missing.
+### Requirements
+
+| Tool                                                    | Needed for                                  | Required?             |
+| ------------------------------------------------------- | ------------------------------------------- | --------------------- |
+| [Neovim](https://neovim.io) 0.10+                       | everything                                  | yes                   |
+| [`curl`](https://curl.se)                               | HTTP requests                               | for HTTP              |
+| [`grpcurl`](https://github.com/fullstorydev/grpcurl)    | `GRPC` requests, service/method completion  | for gRPC              |
+| [`websocat`](https://github.com/vi/websocat)            | `WS` requests                               | for WebSocket         |
+| [`jq`](https://jqlang.github.io/jq)                     | pretty-printing JSON, `:Honk jq`            | optional              |
+| `git`                                                   | faster file listing for `:Honk pick`        | optional              |
+
+Install only what you use. `:checkhealth gooseman` tells you what's missing.
 
 ```lua
 -- lazy.nvim
