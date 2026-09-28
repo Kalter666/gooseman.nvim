@@ -169,10 +169,11 @@ local function draw()
   elseif body ~= "" then
     body = body:gsub("\r", "")
     local json = res.req.method == "GRPC" or (ct or ""):find "json" or type(res.resp.body) == "table"
+    local pretty = false
     if json and vim.fn.executable "jq" == 1 then
       local r = vim.system({ "jq", st.filter or "." }, { stdin = body, text = true }):wait()
       if r.code == 0 then
-        body = r.stdout
+        body, pretty = r.stdout, true
       elseif st.filter then
         body, json = "jq: " .. r.stderr, false
       end
@@ -180,7 +181,7 @@ local function draw()
     for l in vim.gsplit((body:gsub("\n$", "")), "\n") do
       add(l)
     end
-    if json then
+    if json and pretty then -- unformatted body: paths and colours would be wrong
       st.json = not st.filter
       json_hl(hls, lines, st.body_first)
     end

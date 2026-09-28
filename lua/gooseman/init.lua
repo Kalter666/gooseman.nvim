@@ -505,6 +505,8 @@ local function mark(bufnr, b, id, res)
   if id then
     local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, marks, id, {})
     row = pos[1] or row
+  else
+    vim.api.nvim_buf_clear_namespace(bufnr, marks, row, row + 1) -- previous send's result
   end
   return vim.api.nvim_buf_set_extmark(bufnr, marks, row, 0, {
     id = id, virt_text = { { "  " .. text, hl } }, virt_text_pos = "eol",
@@ -541,7 +543,7 @@ function M.send_block(bufnr, lines, b, path)
   view.show { b.req.text .. "  …" }
   local id = vim.api.nvim_buf_is_loaded(bufnr) and mark(bufnr, b)
   M.run(lines, b, path, function(res)
-    if id and vim.api.nvim_buf_is_valid(bufnr) then
+    if id and vim.api.nvim_buf_is_loaded(bufnr) then
       mark(bufnr, b, id, res)
     end
     if res.err then
@@ -593,8 +595,9 @@ end
 
 --- Pick any request in the project's .http files and jump to it.
 function M.pick()
-  local git = vim.system({ "git", "ls-files", "--cached", "--others", "--exclude-standard", "*.http" }, { text = true }):wait()
-  local files = git.code == 0 and vim.split(vim.trim(git.stdout), "\n", { trimempty = true })
+  local git = vim.fn.executable "git" == 1
+    and vim.system({ "git", "ls-files", "--cached", "--others", "--exclude-standard", "*.http" }, { text = true }):wait()
+  local files = git and git.code == 0 and vim.split(vim.trim(git.stdout), "\n", { trimempty = true })
     or vim.fs.find(function(name)
       return name:match "%.http$"
     end, { limit = 500, type = "file" })
@@ -672,9 +675,9 @@ function M.send_all(opts)
       return finish()
     end
     view.show { ("honk all: %d/%d  %s"):format(i, #blocks, b.req.text) }
-    local id = mark(bufnr, b)
+    local id = vim.api.nvim_buf_is_loaded(bufnr) and mark(bufnr, b)
     M.run(lines, b, path, function(res)
-      if vim.api.nvim_buf_is_valid(bufnr) then
+      if id and vim.api.nvim_buf_is_loaded(bufnr) then
         mark(bufnr, b, id, res)
       end
       local name = b.title ~= "" and b.title or b.req.text

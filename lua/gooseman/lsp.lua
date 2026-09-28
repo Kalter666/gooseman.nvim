@@ -133,14 +133,19 @@ end
 
 -- {{refs}} resolved from @vars, the environment, OS env and *cached* responses, never running
 -- anything (no $(shell), no login) since this happens while typing. Unresolvable -> nil.
-local function resolve_plain(str, s)
+-- `mask`: private env and OS env values come out as •••• (for text shown on screen).
+local function resolve_plain(str, s, mask)
   for _ = 1, 5 do -- values may reference other values
     if not str:find "{{" then
       return str
     end
     local stuck = false
     str = str:gsub("{{%s*([%w_%-%.]+)%s*}}", function(k)
-      local v = (s.vars[k] or s.env[k] or {}).value or os.getenv(k)
+      local e = s.vars[k] or s.env[k]
+      if mask and ((e and e.private) or (not e and os.getenv(k))) then
+        return "••••"
+      end
+      local v = e and e.value or os.getenv(k)
       if not v then
         local name, path = k:match "^([^.]+)%.(.+)$"
         local resp = name and g.responses[name]
@@ -349,10 +354,10 @@ local function hint_value(s, ref)
   local v
   if kind == "var" then
     local raw = s.vars[ref].value
-    v = raw:find "%$%(" and "$(…)" or (resolve_plain(raw, s) or raw)
+    v = raw:find "%$%(" and "$(…)" or (resolve_plain(raw, s, true) or raw)
   elseif kind == "envfile" then
     local e = s.env[ref]
-    v = e.private and "••••" or (resolve_plain(e.value, s) or e.value)
+    v = e.private and "••••" or (resolve_plain(e.value, s, true) or e.value)
   elseif kind == "response" then
     local resp = g.responses[name]
     if not resp then
