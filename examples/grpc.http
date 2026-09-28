@@ -1,0 +1,53 @@
+# gRPC via grpcurl. Start the fake server first:
+#   cd tests/grpc_server && go run .
+# grpc://  = plaintext,  grpcs:// or no scheme = TLS
+
+@grpc = grpc://localhost:50051
+
+### list services (server reflection, no auth needed)
+GRPC {{grpc}}
+
+### list methods of one service
+GRPC {{grpc}} grpc.health.v1.Health
+
+### call without auth -> Unauthenticated
+GRPC {{grpc}} grpc.health.v1.Health/Check
+
+{"service": "goose"}
+
+### call with auth: headers become gRPC metadata
+GRPC {{grpc}} grpc.health.v1.Health/Check
+Authorization: Bearer static-token
+
+{"service": "goose"}
+
+### token from env / shell, same as HTTP
+@grpc_token = $(printf static-token)
+GRPC {{grpc}} grpc.health.v1.Health/Check
+Authorization: Bearer {{grpc_token}}
+
+{"service": "goose"}
+
+### empty body sends {}
+GRPC {{grpc}} grpc.health.v1.Health/Check
+Authorization: Bearer static-token
+
+### verbose: show request/response metadata and trailers
+# @args -v
+GRPC {{grpc}} grpc.health.v1.Health/Check
+Authorization: Bearer static-token
+
+{"service": "unknown"}
+
+### no reflection on the server? point grpcurl at the .proto files
+# @args -import-path ./proto -proto helloworld.proto
+GRPC grpc://localhost:50051 helloworld.Greeter/SayHello
+
+{"name": "gooseman"}
+
+### TLS: -insecure skips cert checks; -cert/-key/-cacert for mTLS (use either line)
+# @args -insecure
+# @args -cert ./client.crt -key ./client.key -cacert ./ca.crt
+GRPC grpcs://grpc.example.com:443 pkg.Service/Method
+
+{}

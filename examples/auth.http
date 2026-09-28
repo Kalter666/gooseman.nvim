@@ -1,0 +1,96 @@
+# Authorization recipes. Fake server with protected routes:
+#   python3 tests/echo_server.py
+# Credentials it accepts are listed at the top of tests/echo_server.py.
+
+@host = http://localhost:8080
+
+# ── Basic ────────────────────────────────────────────────────────────
+
+### Basic: let curl encode it (simplest)
+# @args -u gooseman:secret
+GET {{host}}/basic
+
+### Basic: hand-built header, encoded by a shell variable
+@user = gooseman
+@pass = secret
+@basic = $(printf '%s:%s' '{{user}}' '{{pass}}' | base64 -w0)
+GET {{host}}/basic
+Authorization: Basic {{basic}}
+
+### Basic: wrong password -> 401 + WWW-Authenticate
+# @args -u gooseman:nope
+GET {{host}}/basic
+
+# ── Bearer tokens ────────────────────────────────────────────────────
+
+### Bearer: static token
+GET {{host}}/bearer
+Authorization: Bearer static-token
+
+### Bearer: token from an environment variable (keep secrets out of the file)
+# export GOOSE_TOKEN=static-token before starting nvim
+GET {{host}}/bearer
+Authorization: Bearer {{GOOSE_TOKEN}}
+
+### Bearer: token from a password manager / keyring
+# @token = $(pass show work/api-token)
+# @token = $(secret-tool lookup service goose)
+@vault_token = $(printf static-token)
+GET {{host}}/bearer
+Authorization: Bearer {{vault_token}}
+
+### Bearer: log in first, take the token from the JSON response
+@login_token = $(curl -s {{host}}/login -H 'Content-Type: application/json' -d '{"user":"gooseman","password":"secret"}' | jq -r .token)
+GET {{host}}/bearer
+Authorization: Bearer {{login_token}}
+
+# ── OAuth2 ───────────────────────────────────────────────────────────
+
+### OAuth2 client credentials: fetch a token, then call with it (runs on each :Honk)
+@client_id = cli
+@client_secret = cli-secret
+@oauth_token = $(curl -s -u '{{client_id}}:{{client_secret}}' -d grant_type=client_credentials {{host}}/oauth/token | jq -r .access_token)
+GET {{host}}/bearer
+Authorization: Bearer {{oauth_token}}
+
+### OAuth2: look at the raw token response
+POST {{host}}/oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&client_id={{client_id}}&client_secret={{client_secret}}
+
+# ── API keys ─────────────────────────────────────────────────────────
+
+### API key in a header
+GET {{host}}/apikey
+X-API-Key: k3y
+
+### API key in the query string
+GET {{host}}/apikey?api_key=k3y
+
+# ── Cookies / sessions ───────────────────────────────────────────────
+
+### Cookie: send it by hand
+GET {{host}}/cookie
+Cookie: session=s3ss
+
+### Cookie jar: log in and save cookies (curl -c)...
+# @args -c /tmp/gooseman.cookies
+POST {{host}}/login
+Content-Type: application/json
+
+{"user": "gooseman", "password": "secret"}
+
+### ...then reuse them (curl -b)
+# @args -b /tmp/gooseman.cookies
+GET {{host}}/cookie
+
+# ── Client certificates (mTLS) ───────────────────────────────────────
+
+### mTLS: needs a real TLS server; fake server is plain HTTP
+# @args --cert ./client.crt --key ./client.key --cacert ./ca.crt
+GET https://mtls.example.com/whoami
+
+### self-signed server certificate: skip verification (dev only)
+# @args -k
+GET https://self-signed.badssl.com/

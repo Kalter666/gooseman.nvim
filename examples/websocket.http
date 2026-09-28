@@ -1,0 +1,38 @@
+# WebSocket via websocat. Opens an interactive terminal split:
+# type a line + Enter to send, Ctrl-C (in terminal mode) to hang up.
+# Body lines are sent as the first messages right after connecting.
+#
+# Local echo server (websocat can be one):
+#   websocat -t ws-l:127.0.0.1:9000 mirror:
+
+@ws = ws://localhost:9000
+
+### connect and send two messages
+WS {{ws}}
+
+honk
+honk honk
+
+### auth via header on the handshake
+WS {{ws}}/chat
+Authorization: Bearer static-token
+
+hello with a token
+
+### auth via query string (common for browsers-first APIs)
+WS {{ws}}/chat?token={{GOOSE_TOKEN}}
+
+### Basic auth on the handshake
+# @args --basic-auth gooseman:secret
+WS {{ws}}/chat
+
+### subprotocol + origin (some servers check these)
+# @args --protocol graphql-ws --origin http://localhost
+WS {{ws}}/graphql
+
+{"type": "connection_init"}
+
+### public TLS echo server
+WS wss://echo.websocket.org
+
+hello from gooseman
