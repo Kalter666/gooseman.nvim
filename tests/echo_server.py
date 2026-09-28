@@ -13,6 +13,7 @@ Auth-protected routes (401 when credentials are wrong):
   /jwt?ttl=N     POST -> {"token": <JWT expiring in N seconds>}, accepted by /bearer
   /oauth/token   POST form grant_type=client_credentials, client "cli" / "cli-secret"
                  (form fields or Basic auth) -> {"access_token": ...}
+  /image         a 1x1 PNG (binary body)
   /missing/...   always 404
 """
 import base64
@@ -20,6 +21,7 @@ import itertools
 import json
 import sys
 import time
+import zlib
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -38,10 +40,10 @@ def basic(header, user, password):
 
 
 class Echo(BaseHTTPRequestHandler):
-    def reply(self, status, obj, headers=()):
-        out = json.dumps(obj).encode()
+    def reply(self, status, obj, headers=(), ctype="application/json"):
+        out = obj if isinstance(obj, bytes) else json.dumps(obj).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(out)))
         for k, v in headers:
             self.send_header(k, v)
@@ -78,6 +80,12 @@ class Echo(BaseHTTPRequestHandler):
             token = f"login-{next(ISSUED)}"
             TOKENS.add(token)
             return self.reply(200, {"token": token}, [("Set-Cookie", "session=s3ss; HttpOnly")])
+
+        if url.path == "/image":
+            chunk = lambda kind, data: len(data).to_bytes(4, "big") + kind + data + zlib.crc32(kind + data).to_bytes(4, "big")
+            png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", (1).to_bytes(4, "big") * 2 + b"\x08\x02\x00\x00\x00")
+                   + chunk(b"IDAT", zlib.compress(b"\x00\xff\x88\x00")) + chunk(b"IEND", b""))
+            return self.reply(200, png, ctype="image/png")
 
         if url.path == "/jwt":
             ttl = int(query.get("ttl", ["3600"])[0])

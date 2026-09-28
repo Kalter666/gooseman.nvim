@@ -53,8 +53,34 @@ No `setup()` needed.
 | `:Honk env [name]`      | pick an environment from `gooseman.json` (no name = picker, `none` = off)  |
 | `:Honk curl`            | copy the request under the cursor as a shell command                      |
 | `:Honk import`          | clipboard curl command → `.http` block (`:'<,'>Honk import` converts a selection in place) |
+| `:Honk last`            | re-send the last request, from any buffer (handy on a global key while you edit server code) |
+| `:Honk pick`            | pick any request in the project's `.http` files (`vim.ui.select`, so your picker) and jump to it |
+| `:Honk jq [filter]`     | filter the response window through jq; no filter clears it                  |
+| `]r` / `[r`             | next / previous request in a `.http` buffer                                 |
 
 Statusline: `require("gooseman").statusline()` returns `🪿 dev` while an environment is active.
+
+## 🪟 The response window
+
+- The status line turns green or red depending on your `@expect`s.
+- Headers fold closed under their `HTTP/1.1 200 OK` line: `zo` opens them, `zc` closes them.
+- JSON bodies are pretty-printed by jq and highlighted.
+- `q` closes the window, and `R` toggles the raw output.
+- **`yr` copies a reference to the value under the cursor**, e.g. `{{goose.body.items.0.id}}`, ready to paste into
+  the next request. If the request has no name yet, gooseman asks for one, adds `# @name` to it and caches the
+  response, so the reference works right away.
+- **Binary bodies** (images, PDFs, archives) show as `<binary body: 12.3 KB, image/png>` instead of garbage.
+  Press `o` to save the exact bytes and open them in your system viewer.
+
+## 👀 In the `.http` buffer
+
+- **Inline values:** every `{{ref}}` shows its value as an inlay hint, e.g. `{{host}} = http://localhost:8080`.
+  Secrets are masked: private environment values and OS env vars show as `••••`, shell variables as `$(…)`,
+  and cached tokens as `jwt, 4m left`. Toggle with `vim.lsp.inlay_hint.enable()`.
+- **Colours** via LSP semantic tokens: `{{refs}}` by kind (@var, environment, response, OS env), `# @directives`,
+  methods (including `GRPC`/`WS`) and `###` titles. These are the standard `@lsp.type.*` groups, so your colorscheme applies.
+- **Last result** on every `###` line: `⏳ sending…`, then `✓ 200 · 45ms · 14:03` or `✗ 401 · …`. The marks move
+  with your edits, and `:Honk all` refreshes all of them.
 
 ## 📝 The `.http` format
 
@@ -237,6 +263,16 @@ Put a `gooseman.json` next to your `.http` files (or in any parent directory):
 ```
 
 `:Honk env prod` switches, and `{{host}}` follows. `$shared` applies to every environment.
+The choice is remembered per `gooseman.json` across restarts, in Neovim's state directory.
+
+**Production guard:** environments with `prod` in the name ask before every send, and so does any environment
+with `"$confirm": true`. `"$confirm": false` turns off the default for a prod-named one. `:Honk all` asks
+once per run.
+
+```json
+{ "staging": { "host": "https://staging.example.com", "$confirm": true } }
+```
+
 Keep secrets in `gooseman.private.json` (same shape, add it to `.gitignore`). It wins over `gooseman.json`,
 and the LSP hover masks its values. Environment values can use `{{refs}}` and `$(shell)` like `@vars`.
 An `@var` in the file wins over the environment.

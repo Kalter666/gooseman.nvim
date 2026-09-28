@@ -192,4 +192,34 @@ end
 assert(p.expires_at { body = { data = { auth = { token = jwt { exp = now + 42 } } } } } == now + 42)
 assert(p.expires_at { body = { result = { credentials = { expires_in = 10 } } }, at = now } == now + 10)
 assert(p.expires_at { body = { list = { { t = jwt { exp = now + 9 } }, { t = jwt { exp = now + 7 } } } } } == now + 7)
+
+-- split_http keeps binary bodies byte-exact (only header \r's go)
+local png = "\137PNG\r\n\26\n\0\0\r\n"
+local heads, body = p.split_http("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n" .. png)
+assert(#heads == 2 and heads[2] == "HTTP/1.1 200 OK\nContent-Type: image/png\n", vim.inspect(heads))
+assert(body == png, "binary body changed")
+heads, body = p.split_http "HTTP/1.1 204 No Content\n\n"
+assert(#heads == 1 and body == "")
+
+-- JSON path of the value under the cursor, from jq's pretty output
+local view = require "gooseman.view"
+local jl = vim.split([[{
+  "user": {
+    "id": 7,
+    "tags": [
+      "a",
+      {
+        "deep": true
+      }
+    ]
+  },
+  "odd key": 1
+}]], "\n")
+assert(view.json_path(jl, 1, 3) == "user.id")
+assert(view.json_path(jl, 1, 5) == "user.tags.0")
+assert(view.json_path(jl, 1, 7) == "user.tags.1.deep")
+assert(view.json_path(jl, 1, 6) == "user.tags.1")
+assert(view.json_path(jl, 1, 9) == "user.tags") -- closing ] names its array
+assert(view.json_path(jl, 1, 11) == nil) -- "odd key" can't be a {{ref}} path
+assert(view.json_path(jl, 1, 1) == "")
 print "ok"

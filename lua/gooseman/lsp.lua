@@ -6,6 +6,8 @@
 --   diagnostics  undefined refs, unknown methods/directives, bad @expect, duplicate names
 --   code actions send, copy as curl, name request, extract to @var, @expect from last response,
 --                gRPC body template
+--   inlay hints  {{ref}} = its value (secrets masked, tokens as "jwt, 4m left")
+--   semantic     {{refs}} coloured by kind, directives, methods, ### titles
 
 local g = require "gooseman"
 local env = require "gooseman.env"
@@ -327,6 +329,120 @@ local function ref_at(params)
   end
 end
 
+local function duration(sec)
+  return sec >= 3600 and ("%dh%02dm"):format(sec / 3600, sec % 3600 / 60)
+    or sec >= 60 and ("%dm%02ds"):format(sec / 60, sec % 60)
+    or (sec .. "s")
+end
+
+local function token_note(v)
+  local exp = g.jwt_exp(v)
+  if exp then
+    local left = exp - os.time()
+    return "jwt, " .. (left <= 0 and "expired" or (duration(left) .. " left"))
+  end
+end
+
+-- short, safe text for an inlay hint; nil = no hint
+local function hint_value(s, ref)
+  local kind, name = kind_of(s, ref)
+  local v
+  if kind == "var" then
+    local raw = s.vars[ref].value
+    v = raw:find "%$%(" and "$(…)" or (resolve_plain(raw, s) or raw)
+  elseif kind == "envfile" then
+    local e = s.env[ref]
+    v = e.private and "••••" or (resolve_plain(e.value, s) or e.value)
+  elseif kind == "response" then
+    local resp = g.responses[name]
+    if not resp then
+      return "not sent yet"
+    end
+    v = g.field(resp, ref:sub(#name + 2))
+    if not v then
+      return nil
+    end
+    local note = token_note(v)
+    if note then
+      return note
+    end
+  elseif kind == "env" then
+    return "••••" -- OS env: likely a secret, never shown
+  else
+    return nil
+  end
+  return #v > 40 and (v:sub(1, 37) .. "…") or v
+end
+
+local function inlay_hints(params)
+  local uri = params.textDocument.uri
+  local lines = buf_lines(uri)
+  local s = scan(lines, uri)
+  local out = {}
+  for row = params.range.start.line + 1, math.min(params.range["end"].line + 1, #lines) do
+    local l = lines[row]
+    if not l:match "^%s*#" or l:match "^%s*#%s*@" then
+      for _, r in ipairs(g.refs(l)) do
+        local v = hint_value(s, r.ref)
+        if v then
+          out[#out + 1] = { position = { line = row - 1, character = r.e }, label = "= " .. v, paddingLeft = true }
+        end
+      end
+    end
+  end
+  return out
+end
+
+local TOKEN_TYPES = { "variable", "parameter", "function", "enumMember", "macro", "keyword", "namespace" }
+local TT = { var = 0, envfile = 1, response = 2, env = 3, directive = 4, method = 5, title = 6 }
+
+local function semantic_tokens(params)
+  local uri = params.textDocument.uri
+  local lines = buf_lines(uri)
+  local s = scan(lines, uri)
+  local toks = {}
+  for row, l in ipairs(lines) do
+    if l:match "^###" then
+      toks[#toks + 1] = { row - 1, 0, #l, TT.title }
+    elseif not l:match "^%s*//" then
+      local dir = l:match "^%s*#%s*@" and l:find "@[%w%-]+"
+      if dir then
+        local _, e = l:find("@[%w%-]+", dir)
+        toks[#toks + 1] = { row - 1, dir - 1, e - dir + 1, TT.directive }
+      end
+      local name = l:match "^@([%w_%-]+)"
+      if name then
+        toks[#toks + 1] = { row - 1, 0, #name + 1, TT.var }
+      end
+      if dir or not l:match "^%s*#" then
+        for _, r in ipairs(g.refs(l)) do
+          local kind = kind_of(s, r.ref)
+          if kind then
+            toks[#toks + 1] = { row - 1, r.s - 1, r.e - r.s + 1, TT[kind] }
+          end
+        end
+      end
+    end
+  end
+  for _, b in ipairs(s.blocks) do
+    local m = b.req and b.req.text:match "^(%u+)%s"
+    if m and g.METHODS[m] then
+      local col = lines[b.req.line]:find(m, 1, true)
+      toks[#toks + 1] = { b.req.line - 1, col - 1, #m, TT.method }
+    end
+  end
+  table.sort(toks, function(a, b)
+    return a[1] < b[1] or (a[1] == b[1] and a[2] < b[2])
+  end)
+  local data, pr, pc = {}, 0, 0
+  for _, t in ipairs(toks) do
+    local dl = t[1] - pr
+    vim.list_extend(data, { dl, dl == 0 and (t[2] - pc) or t[2], t[3], t[4], 0 })
+    pr, pc = t[1], t[2]
+  end
+  return { data = data }
+end
+
 local function hover(params)
   local r, lines = ref_at(params)
   if not r then
@@ -354,10 +470,7 @@ local function hover(params)
     local exp = resp and g.expires_at(resp)
     if exp then
       local left = exp - os.time()
-      local fmt = left >= 3600 and ("%dh%02dm"):format(left / 3600, left % 3600 / 60)
-        or left >= 60 and ("%dm%02ds"):format(left / 60, left % 60)
-        or (left .. "s")
-      text = text .. "\n\n" .. (left <= 0 and "*token expired, refreshes on next use*" or ("*token expires in " .. fmt .. "*"))
+      text = text .. "\n\n" .. (left <= 0 and "*token expired, refreshes on next use*" or ("*token expires in " .. duration(left) .. "*"))
     end
   elseif kind == "env" then
     -- never show secrets in a popup
@@ -598,6 +711,8 @@ local handlers = {
         hoverProvider = true,
         definitionProvider = true,
         codeActionProvider = true,
+        inlayHintProvider = true,
+        semanticTokensProvider = { legend = { tokenTypes = TOKEN_TYPES, tokenModifiers = {} }, full = true },
         executeCommandProvider = { commands = vim.tbl_keys(COMMANDS) },
       },
       serverInfo = { name = "gooseman" },
@@ -608,6 +723,8 @@ local handlers = {
   ["textDocument/hover"] = hover,
   ["textDocument/definition"] = definition,
   ["textDocument/codeAction"] = code_actions,
+  ["textDocument/inlayHint"] = inlay_hints,
+  ["textDocument/semanticTokens/full"] = semantic_tokens,
   ["workspace/executeCommand"] = function(params)
     local f = COMMANDS[params.command]
     if f then
@@ -641,6 +758,10 @@ local function server(dispatchers)
   refreshers[dispatchers] = function()
     for uri in pairs(open) do
       publish(uri)
+    end
+    -- values behind hints/colours changed (new cached response, other env): ask to re-fetch
+    for _, m in ipairs { "workspace/inlayHint/refresh", "workspace/semanticTokens/refresh" } do
+      pcall(dispatchers.server_request, m, nil)
     end
   end
   return {

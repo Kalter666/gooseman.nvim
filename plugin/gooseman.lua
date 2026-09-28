@@ -3,7 +3,10 @@
 -- :Honk env [name] pick an environment from gooseman.json ("none" to clear)
 -- :Honk curl       copy the request under the cursor as a shell command
 -- :[range]Honk import   curl command (range, else clipboard) -> .http block
-local SUB = { "all", "env", "curl", "import" }
+-- :Honk last       re-send the last request, from any buffer
+-- :Honk pick       jump to any request in the project's .http files
+-- :Honk jq [filter]  filter the response window through jq (no filter = clear)
+local SUB = { "all", "env", "curl", "import", "last", "pick", "jq" }
 
 local function starting(list, lead)
   return vim.tbl_filter(function(n)
@@ -20,6 +23,12 @@ vim.api.nvim_create_user_command("Honk", function(o)
     g.send_all { fresh = o.bang }
   elseif sub == "env" then
     require("gooseman.env").select(vim.api.nvim_buf_get_name(0), arg)
+  elseif sub == "last" then
+    g.send_last()
+  elseif sub == "pick" then
+    g.pick()
+  elseif sub == "jq" then
+    require("gooseman.view").jq(table.concat(vim.list_slice(o.fargs, 2), " "))
   elseif sub == "curl" then
     g.copy_curl()
   elseif sub == "import" then
