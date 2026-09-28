@@ -1,5 +1,6 @@
 -- gRPC server reflection via grpcurl: method names for completion, JSON body templates.
--- ponytail: no auth metadata on reflection calls; servers that guard reflection need `-H` support here
+-- `flags` are extra grpcurl flags from the request (-H metadata, -insecure, -cert ...), so
+-- servers that guard reflection behind auth work too.
 
 local M = {}
 
@@ -10,6 +11,7 @@ local TIMEOUT = 3000
 
 -- flags go before the address, the verb + its args after it
 local function grpcurl(url, flags, ...)
+  flags = vim.deepcopy(flags)
   local cmd = vim.list_extend({ "grpcurl", "-max-time", "3" }, flags)
   if url:match "^grpc://" then
     table.insert(cmd, "-plaintext")
@@ -25,22 +27,23 @@ local function grpcurl(url, flags, ...)
   return r.stdout
 end
 
---- Every method on the server as "pkg.Service/Method"; cached per address.
-function M.methods(url)
+--- Every method on the server as "pkg.Service/Method"; cached per address once it succeeds.
+function M.methods(url, flags)
+  flags = flags or {}
   if M.cache[url] then
     return M.cache[url]
   end
   if vim.fn.executable "grpcurl" == 0 then
     return {}
   end
-  local services = grpcurl(url, {}, "list")
+  local services = grpcurl(url, flags, "list")
   if not services then
     return {} -- not cached: the server may just not be up yet
   end
   local out = {}
   for svc in services:gmatch "[^\n]+" do
     if not svc:match "^grpc%.reflection%." then
-      for m in (grpcurl(url, {}, "list", svc) or ""):gmatch "[^\n]+" do
+      for m in (grpcurl(url, flags, "list", svc) or ""):gmatch "[^\n]+" do
         out[#out + 1] = svc .. "/" .. m:sub(#svc + 2)
       end
     end
@@ -50,8 +53,9 @@ function M.methods(url)
 end
 
 --- JSON template for a method's request message, e.g. `{ "service": "" }`.
-function M.template(url, method)
-  local desc, err = grpcurl(url, {}, "describe", (method:gsub("/", ".")))
+function M.template(url, method, flags)
+  flags = flags or {}
+  local desc, err = grpcurl(url, flags, "describe", (method:gsub("/", ".")))
   if not desc then
     return nil, err
   end
@@ -61,7 +65,7 @@ function M.template(url, method)
   end
   input = input:gsub("^stream%s+", "")
   local msg
-  msg, err = grpcurl(url, { "-msg-template" }, "describe", input)
+  msg, err = grpcurl(url, vim.list_extend({ "-msg-template" }, flags), "describe", input)
   if not msg then
     return nil, err
   end

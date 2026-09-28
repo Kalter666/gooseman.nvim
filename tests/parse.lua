@@ -187,4 +187,9 @@ local G = require "vim.lsp._snippet_grammar"
 for _, sn in ipairs(require("gooseman.snippets").list) do
   assert(pcall(G.parse, require("gooseman.snippets").lsp_body(sn.body)), sn.prefix)
 end
+
+-- nested tokens: {"data": {"auth": {"token": <jwt>}}}, and expires_in below the top level
+assert(p.expires_at { body = { data = { auth = { token = jwt { exp = now + 42 } } } } } == now + 42)
+assert(p.expires_at { body = { result = { credentials = { expires_in = 10 } } }, at = now } == now + 10)
+assert(p.expires_at { body = { list = { { t = jwt { exp = now + 9 } }, { t = jwt { exp = now + 7 } } } } } == now + 7)
 print "ok"

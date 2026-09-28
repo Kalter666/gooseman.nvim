@@ -129,15 +129,59 @@ local function response_keys(name, path)
   return keys
 end
 
--- {{refs}} resolved without running anything ($(shell) or nested refs -> nil)
+-- {{refs}} resolved from @vars, the environment, OS env and *cached* responses, never running
+-- anything (no $(shell), no login) since this happens while typing. Unresolvable -> nil.
 local function resolve_plain(str, s)
-  local out = str:gsub("{{%s*([%w_%-]+)%s*}}", function(k)
-    local v = (s.vars[k] or s.env[k] or {}).value or os.getenv(k)
-    if v and not v:find "{{" and not v:find "%$%(" then
-      return v
+  for _ = 1, 5 do -- values may reference other values
+    if not str:find "{{" then
+      return str
     end
-  end)
-  return not out:find "{{" and out or nil
+    local stuck = false
+    str = str:gsub("{{%s*([%w_%-%.]+)%s*}}", function(k)
+      local v = (s.vars[k] or s.env[k] or {}).value or os.getenv(k)
+      if not v then
+        local name, path = k:match "^([^.]+)%.(.+)$"
+        local resp = name and g.responses[name]
+        v = resp and g.field(resp, path)
+      end
+      if not v or v:find "%$%(" then
+        stuck = true
+        return nil
+      end
+      return v
+    end)
+    if stuck then
+      return nil
+    end
+  end
+  return not str:find "{{" and str or nil
+end
+
+-- grpcurl flags for reflection calls: the block's (and file-wide) headers as -H, plus @args.
+-- Anything that can't be resolved without sending is left out.
+local function grpc_flags(s, b)
+  local own, headers, flags = {}, {}, {}
+  for _, h in ipairs(b and b.headers or {}) do
+    own[(h.text:match "^([^:]+)" or ""):lower()] = true
+  end
+  for _, h in ipairs(s.file_headers) do
+    if not own[(h.text:match "^([^:]+)" or ""):lower()] then
+      headers[#headers + 1] = h
+    end
+  end
+  for _, h in ipairs(vim.list_extend(headers, b and b.headers or {})) do
+    local v = resolve_plain(h.text, s)
+    if v then
+      vim.list_extend(flags, { "-H", v })
+    end
+  end
+  for _, a in ipairs(vim.list_extend(vim.list_extend({}, s.file_args), b and b.args or {})) do
+    local v = resolve_plain(a.text, s)
+    if v then
+      vim.list_extend(flags, vim.split(v, "%s+", { trimempty = true }))
+    end
+  end
+  return flags
 end
 
 local function has_file_header(s, header)
@@ -245,7 +289,7 @@ local function complete(params)
       start = { line = row - 1, character = #before - #partial },
       ["end"] = { line = row - 1, character = #before },
     }
-    for _, m in ipairs(resolved and grpc.methods(resolved) or {}) do
+    for _, m in ipairs(resolved and grpc.methods(resolved, grpc_flags(s, g.block_at(s, row))) or {}) do
       out[#out + 1] = { label = m, kind = K.Method, detail = "gRPC " .. resolved, textEdit = { range = range, newText = m } }
     end
     return out
@@ -466,13 +510,17 @@ local COMMANDS = {
     vim.api.nvim_buf_set_lines(bufnr, at, at, false, add)
   end,
   ["gooseman.grpc_template"] = function(uri, row)
-    local b, bufnr, _, s = block_for(uri, row)
-    local url, method = b.req.text:match "^GRPC%s+(%S+)%s+(%S+)"
-    local resolved = url and resolve_plain(url, s)
-    if not resolved then
-      return vim.notify("gooseman: can't resolve " .. tostring(url) .. " without sending", vim.log.levels.WARN)
+    -- explicit action: full expansion, so a login it depends on may run
+    local b, bufnr, lines = block_for(uri, row)
+    local ok, req = pcall(g.build, g.context(lines, vim.uri_to_fname(uri)), b)
+    if not ok then
+      return vim.notify("gooseman: " .. (type(req) == "table" and "request depends on itself" or req), vim.log.levels.WARN)
     end
-    local tmpl, err = grpc.template(resolved, method)
+    local flags = vim.deepcopy(req.args)
+    for _, h in ipairs(req.headers) do
+      vim.list_extend(flags, { "-H", h })
+    end
+    local tmpl, err = grpc.template(req.url, req.target, flags)
     if not tmpl then
       return vim.notify("gooseman: " .. err, vim.log.levels.WARN)
     end

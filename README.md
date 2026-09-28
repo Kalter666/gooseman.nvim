@@ -206,8 +206,9 @@ Authorization: Bearer someone-else
 
 - **Runs on demand.** The first `:Honk` that needs `{{login.…}}` runs `login` first, then caches its response.
 - **Cached for the session.** Any file can use the cache: honk `login` in `auth.http` and use `{{login.body.token}}` in `orders.http`.
-- **Refresh before expiry.** If the cached login holds a JWT (any top-level body field) whose `exp` is less than
-  30s away, or an OAuth `expires_in` that's about to run out, it logs in again *before* sending. No 401, no retry.
+- **Refresh before expiry.** If the cached login holds a JWT whose `exp` is less than 30s away, or an OAuth
+  `expires_in` that's about to run out, it logs in again *before* sending. Both are found anywhere in the
+  response, nested fields included (`{"data": {"auth": {"token": …}}}`). No 401, no retry.
   The margin is `require("gooseman").EXPIRY_SKEW`, and hover shows how long a token has left.
 - **Auto-refresh.** A request that still gets a **401** while using a cached response re-runs that dependency
   and retries once. Honk `login` again to refresh it by hand, or run `:Honk!` to forget every cached response.
@@ -319,6 +320,10 @@ and your usual LSP keymaps and completion plugin (blink.cmp, nvim-cmp) pick it u
 - `GRPC host:port pkg.Service/Method` calls it. The body is the JSON request (empty body sends `{}`).
 - Method names complete from the server's reflection, cached per address. The *insert gRPC request template*
   code action fills in an empty body with every field of the request message.
+- If the server puts reflection behind auth, the request's headers (file-wide ones too) and `@args` go along.
+  Completion only uses values it can resolve without sending anything: variables, the environment and *cached*
+  responses. So with `Authorization: Bearer {{login.body.token}}`, honk `login` once and completion works.
+  The template code action does a full expansion and runs the login itself if it needs to.
 - No reflection on the server? Use `# @args -import-path ./proto -proto service.proto`.
 
 ## 🔌 WebSocket

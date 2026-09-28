@@ -194,22 +194,25 @@ local function jwt_exp(s)
 end
 
 --- When a cached response's credentials run out (epoch seconds), or nil if unknown:
---- the earliest JWT `exp` among top-level body strings, or `expires_in` (OAuth) after it arrived.
--- ponytail: top-level body fields only; nested tokens ({"data": {"token": ...}}) aren't checked
+--- the earliest JWT `exp` and `expires_in` (OAuth, counted from arrival) anywhere in the body.
 function M.expires_at(resp)
   local t
-  local function earliest(x)
+  local function visit(v, depth)
+    local x
+    if type(v) == "string" then
+      x = jwt_exp(v)
+    elseif type(v) == "table" and depth < 5 then
+      local ttl = not vim.islist(v) and tonumber(v.expires_in)
+      x = ttl and resp.at and (resp.at + ttl)
+      for _, child in pairs(v) do
+        visit(child, depth + 1)
+      end
+    end
     if x and (not t or x < t) then
       t = x
     end
   end
-  if type(resp.body) == "table" and not vim.islist(resp.body) then
-    for _, v in pairs(resp.body) do
-      earliest(jwt_exp(v))
-    end
-    local ttl = tonumber(resp.body.expires_in)
-    earliest(ttl and resp.at and (resp.at + ttl))
-  end
+  visit(resp.body, 0)
   return t
 end
 
