@@ -206,7 +206,10 @@ Authorization: Bearer someone-else
 
 - **Runs on demand.** The first `:Honk` that needs `{{login.…}}` runs `login` first, then caches its response.
 - **Cached for the session.** Any file can use the cache: honk `login` in `auth.http` and use `{{login.body.token}}` in `orders.http`.
-- **Auto-refresh.** A request that gets a **401** while using a cached response re-runs that dependency
+- **Refresh before expiry.** If the cached login holds a JWT (any top-level body field) whose `exp` is less than
+  30s away, or an OAuth `expires_in` that's about to run out, it logs in again *before* sending. No 401, no retry.
+  The margin is `require("gooseman").EXPIRY_SKEW`, and hover shows how long a token has left.
+- **Auto-refresh.** A request that still gets a **401** while using a cached response re-runs that dependency
   and retries once. Honk `login` again to refresh it by hand, or run `:Honk!` to forget every cached response.
 - **No self-reference.** A request never uses its own response: `login` skips the file-wide header built from it.
 - **Response fields:** `status`, `headers.<name>` (any case), and `body.<key>.<key>`. Arrays use a 0-based index: `{{list.body.items.0.id}}`.
@@ -269,6 +272,33 @@ chains work, and prints a report. Failures go to the quickfix list. See [`exampl
   - `-L`, `-k`, `--compressed` and other flags go into `# @args`
   - It handles `'…'`, `"…"`, `$'…'` quoting and `\` line continuations.
 
+## ✂️ Snippets
+
+Snippets come from the built-in LSP, so blink.cmp or nvim-cmp expand them with no snippet plugin needed.
+Type the prefix at the start of a line:
+
+| Prefix | Inserts |
+| --- | --- |
+| `get` `delete` | request with an `Accept` header |
+| `post-json` `put-json` `patch-json` | request with a JSON body |
+| `post-form` | urlencoded form |
+| `graphql` | GraphQL query + variables over POST |
+| `upload` | multipart upload (`-F file=@…`) |
+| `grpc` `grpc-list` | gRPC call / service listing |
+| `ws` | WebSocket connection |
+| `auth-basic` `auth-digest` | Basic / Digest via curl `-u` |
+| `auth-bearer` `auth-apikey` `auth-apikey-query` | token in a header / query string |
+| `auth-login` | named `login` request **+ a file-wide `Authorization` header from its token** |
+| `auth-oauth-cc` `auth-oauth-password` | OAuth2 client-credentials / password grant **+ file-wide header** |
+| `auth-cookie` | log in with a cookie jar, then reuse the session |
+| `auth-mtls` | client certificate |
+| `auth-aws` | AWS SigV4 signing (curl `--aws-sigv4`, keys from env vars) |
+| `expect-ok` `expect-json` | common `@expect` lines |
+| `http-file` | a new file: host, login, file-wide header, first request |
+
+The `auth-login` and `auth-oauth-*` snippets also add the `# @header` line at the top of the file, unless it
+already has an `Authorization` header there.
+
 ## 🧠 Built-in LSP
 
 Opening a `.http` file starts a tiny language server inside Neovim. There's no binary and nothing to configure,
@@ -276,16 +306,19 @@ and your usual LSP keymaps and completion plugin (blink.cmp, nvim-cmp) pick it u
 
 | Feature         | What it does                                                                             |
 | --------------- | ---------------------------------------------------------------------------------------- |
-| Completion      | `{{` variables, environment variables and named requests, `{{login.body.` response fields (from the cache), methods, headers, common header values, `# @` directives, `@expect` paths and operators |
-| Hover           | what `{{ref}}` resolves to. Shell vars show their command without running it; private environment values and OS env vars are masked |
+| Completion      | snippets; `{{` variables, environment variables and named requests; `{{login.body.` response fields (from the cache); methods; gRPC `pkg.Service/Method` names from the server's reflection; headers, common header values, `# @` directives, `@expect` paths and operators |
+| Hover           | what `{{ref}}` resolves to, and how long a cached token has left. Shell vars show their command without running it; private environment values and OS env vars are masked |
 | Go to definition| `{{ref}}` jumps to its `@var` line, the `# @name` line, or the entry in `gooseman.json`  |
 | Diagnostics     | undefined `{{refs}}` (re-checked on `:Honk env`), unknown methods, unknown directives, invalid `@expect`, duplicate `@name`s |
+| Code actions    | send · copy as curl · name this request · add `@expect` lines from the last response · insert the gRPC request body template · extract a selection into an `@var` (select a value, then code action) |
 
 ## 🛰️ gRPC
 
 - `GRPC host:port` lists services (uses server reflection).
 - `GRPC host:port pkg.Service` lists that service's methods.
 - `GRPC host:port pkg.Service/Method` calls it. The body is the JSON request (empty body sends `{}`).
+- Method names complete from the server's reflection, cached per address. The *insert gRPC request template*
+  code action fills in an empty body with every field of the request message.
 - No reflection on the server? Use `# @args -import-path ./proto -proto service.proto`.
 
 ## 🔌 WebSocket

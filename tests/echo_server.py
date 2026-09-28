@@ -10,6 +10,7 @@ Auth-protected routes (401 when credentials are wrong):
   /cookie        cookie "session=s3ss"
   /login         POST {"user": "gooseman", "password": "secret"} -> sets the cookie, returns a fresh token
   /logout        revokes every token /login issued (simulates expiry)
+  /jwt?ttl=N     POST -> {"token": <JWT expiring in N seconds>}, accepted by /bearer
   /oauth/token   POST form grant_type=client_credentials, client "cli" / "cli-secret"
                  (form fields or Basic auth) -> {"access_token": ...}
   /missing/...   always 404
@@ -18,6 +19,7 @@ import base64
 import itertools
 import json
 import sys
+import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -76,6 +78,13 @@ class Echo(BaseHTTPRequestHandler):
             token = f"login-{next(ISSUED)}"
             TOKENS.add(token)
             return self.reply(200, {"token": token}, [("Set-Cookie", "session=s3ss; HttpOnly")])
+
+        if url.path == "/jwt":
+            ttl = int(query.get("ttl", ["3600"])[0])
+            b64 = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+            token = f'{b64({"alg": "none"})}.{b64({"sub": "gooseman", "n": next(ISSUED), "exp": int(time.time()) + ttl})}.'
+            TOKENS.add(token)
+            return self.reply(200, {"token": token})
 
         if url.path == "/logout":
             TOKENS.difference_update({t for t in TOKENS if t.startswith("login-")})

@@ -175,16 +175,56 @@ function M.to_response(method, stdout)
   end
   local ok, decoded = pcall(vim.json.decode, body)
   resp.body = ok and decoded or body
+  resp.at = os.time()
   return resp
+end
+
+--- Seconds before expiry at which a cached token counts as stale.
+M.EXPIRY_SKEW = 30
+
+local function jwt_exp(s)
+  local payload = type(s) == "string" and s:match "^[%w_%-]+%.([%w_%-]+)%.[%w_%-]*$"
+  if not payload then
+    return nil
+  end
+  payload = payload:gsub("%-", "+"):gsub("_", "/")
+  local ok, json = pcall(vim.base64.decode, payload .. string.rep("=", (4 - #payload % 4) % 4))
+  ok, json = pcall(vim.json.decode, ok and json or "")
+  return ok and type(json) == "table" and tonumber(json.exp) or nil
+end
+
+--- When a cached response's credentials run out (epoch seconds), or nil if unknown:
+--- the earliest JWT `exp` among top-level body strings, or `expires_in` (OAuth) after it arrived.
+-- ponytail: top-level body fields only; nested tokens ({"data": {"token": ...}}) aren't checked
+function M.expires_at(resp)
+  local t
+  local function earliest(x)
+    if x and (not t or x < t) then
+      t = x
+    end
+  end
+  if type(resp.body) == "table" and not vim.islist(resp.body) then
+    for _, v in pairs(resp.body) do
+      earliest(jwt_exp(v))
+    end
+    local ttl = tonumber(resp.body.expires_in)
+    earliest(ttl and resp.at and (resp.at + ttl))
+  end
+  return t
 end
 
 local expand
 
 -- Response of a named request: cached, or run it now (synchronously) and cache it.
 local function response_for(ctx, name, depth)
-  if M.responses[name] then
-    ctx.from_cache[name] = true
-    return M.responses[name]
+  local cached = M.responses[name]
+  if cached then
+    local exp = M.expires_at(cached)
+    if not (exp and exp - M.EXPIRY_SKEW <= os.time()) then
+      ctx.from_cache[name] = true
+      return cached
+    end
+    M.responses[name] = nil -- token (nearly) expired: log in again now rather than eat a 401
   end
   local b = ctx.s.names[name]
   if not b then
@@ -408,6 +448,13 @@ local function format_http(out)
   return head .. "\n" .. body
 end
 
+--- Last response of every request sent, for the LSP's "add @expect from last response".
+M.last = {}
+
+function M.last_key(path, b)
+  return (path or "") .. "\0" .. b.req.text
+end
+
 M.REFRESH_COOLDOWN = 60
 local refreshed_at = {} -- named request -> os.time() of its last auto-refresh
 
@@ -449,6 +496,7 @@ function M.run(lines, b, path, cb)
       if req.name and r.code == 0 then
         M.responses[req.name] = resp
       end
+      M.last[M.last_key(path, b)] = resp
       local checks = expect.check(b.expects, resp, r.code, M.field, function(v)
         return M.expand(v, ctx)
       end)

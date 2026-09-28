@@ -1,12 +1,17 @@
 -- In-process language server for .http files: no binary, runs inside nvim.
---   completion   {{vars}}, {{named.body.fields}}, methods, headers, header values, # @directives
---   hover        what a {{ref}} resolves to (shell vars are shown, not run; secrets masked)
+--   completion   snippets, {{vars}}, {{named.body.fields}}, methods, gRPC methods (reflection),
+--                headers, header values, # @directives, @expect paths/operators
+--   hover        what a {{ref}} resolves to (shell vars are shown, not run; secrets masked; token expiry)
 --   definition   {{ref}} -> its @var line, `# @name` line or gooseman.json entry
 --   diagnostics  undefined refs, unknown methods/directives, bad @expect, duplicate names
+--   code actions send, copy as curl, name request, extract to @var, @expect from last response,
+--                gRPC body template
 
 local g = require "gooseman"
 local env = require "gooseman.env"
 local expect = require "gooseman.expect"
+local snippets = require "gooseman.snippets"
+local grpc = require "gooseman.grpc"
 
 local M = {}
 
@@ -124,6 +129,52 @@ local function response_keys(name, path)
   return keys
 end
 
+-- {{refs}} resolved without running anything ($(shell) or nested refs -> nil)
+local function resolve_plain(str, s)
+  local out = str:gsub("{{%s*([%w_%-]+)%s*}}", function(k)
+    local v = (s.vars[k] or s.env[k] or {}).value or os.getenv(k)
+    if v and not v:find "{{" and not v:find "%$%(" then
+      return v
+    end
+  end)
+  return not out:find "{{" and out or nil
+end
+
+local function has_file_header(s, header)
+  local name = header:match("^([^:]+)"):lower()
+  for _, h in ipairs(s.file_headers) do
+    if (h.text:match "^([^:]+)" or ""):lower() == name then
+      return true
+    end
+  end
+end
+
+local function snippet_items(s, row)
+  local out = {}
+  for _, sn in ipairs(snippets.list) do
+    local body = sn.body
+    local item = {
+      label = sn.prefix,
+      kind = K.Snippet,
+      detail = sn.desc,
+      insertTextFormat = vim.lsp.protocol.InsertTextFormat.Snippet,
+      documentation = { kind = "markdown", value = "```http\n" .. snippets.preview(body) .. "\n```" },
+    }
+    if sn.header and not has_file_header(s, sn.header) then
+      local line = "# @header " .. sn.header .. "\n"
+      if row == 1 then
+        body = line .. body -- the edit would collide with the snippet at the top of the file
+      else
+        local top = { line = 0, character = 0 }
+        item.additionalTextEdits = { { range = { start = top, ["end"] = top }, newText = line } }
+      end
+    end
+    item.insertText = snippets.lsp_body(body)
+    out[#out + 1] = item
+  end
+  return out
+end
+
 local function items(labels, kind, detail)
   local out = {}
   for _, l in ipairs(labels) do
@@ -186,8 +237,24 @@ local function complete(params)
   end
 
   local r = role(lines, s, row)
+  local url, partial = before:match "^GRPC%s+(%S+)%s+(%S*)$"
+  if r == "request" and url then
+    local resolved = resolve_plain(url, s)
+    local out = {}
+    local range = {
+      start = { line = row - 1, character = #before - #partial },
+      ["end"] = { line = row - 1, character = #before },
+    }
+    for _, m in ipairs(resolved and grpc.methods(resolved) or {}) do
+      out[#out + 1] = { label = m, kind = K.Method, detail = "gRPC " .. resolved, textEdit = { range = range, newText = m } }
+    end
+    return out
+  end
   if r == "request" and before:match "^%u*$" then
-    return items(vim.tbl_keys(g.METHODS), K.Keyword)
+    return vim.list_extend(items(vim.tbl_keys(g.METHODS), K.Keyword), snippet_items(s, row))
+  end
+  if r ~= "header" and before:match "^%a[%w%-]*$" then
+    return snippet_items(s, row)
   end
   if r == "header" then
     local hname = before:match "^%s*([%w%-]+):%s*[^{]*$"
@@ -240,6 +307,14 @@ local function hover(params)
     local v = resp and g.field(resp, r.ref:sub(#name + 2))
     text = resp and ("```\n" .. tostring(v) .. "\n```\n*cached response of `" .. name .. "`*")
       or ("`" .. name .. "` not sent yet, runs automatically on first use")
+    local exp = resp and g.expires_at(resp)
+    if exp then
+      local left = exp - os.time()
+      local fmt = left >= 3600 and ("%dh%02dm"):format(left / 3600, left % 3600 / 60)
+        or left >= 60 and ("%dm%02ds"):format(left / 60, left % 60)
+        or (left .. "s")
+      text = text .. "\n\n" .. (left <= 0 and "*token expired, refreshes on next use*" or ("*token expires in " .. fmt .. "*"))
+    end
   elseif kind == "env" then
     -- never show secrets in a popup
     text = ("env `$%s` is set (%d chars)"):format(r.ref, #os.getenv(r.ref))
@@ -318,6 +393,153 @@ function M.diagnostics(lines, uri)
   return out
 end
 
+local function slug(str)
+  local out = str:lower():gsub("[^%w]+", "_"):gsub("^_+", ""):gsub("_+$", ""):sub(1, 30)
+  return out ~= "" and out or "req"
+end
+
+-- run f in a window showing the buffer, cursor on row (for commands that act "at cursor")
+local function at_row(uri, row, f)
+  local win = vim.fn.bufwinid(vim.uri_to_bufnr(uri))
+  if win ~= -1 then
+    vim.api.nvim_win_call(win, function()
+      vim.api.nvim_win_set_cursor(0, { row, 0 })
+      f()
+    end)
+  end
+end
+
+local function block_for(uri, row)
+  local lines, bufnr = buf_lines(uri)
+  local s = scan(lines, uri)
+  return g.block_at(s, row), bufnr, lines, s
+end
+
+local COMMANDS = {
+  ["gooseman.send"] = function(uri, row)
+    at_row(uri, row, g.send)
+  end,
+  ["gooseman.curl"] = function(uri, row)
+    at_row(uri, row, g.copy_curl)
+  end,
+  ["gooseman.name"] = function(uri, row)
+    local b, bufnr = block_for(uri, row)
+    vim.ui.input({ prompt = "request name: ", default = slug(b.title ~= "" and b.title or b.req.text) }, function(name)
+      if name and name:match "^[%w_%-]+$" then
+        local at = b.sep or (b.first - 1)
+        vim.api.nvim_buf_set_lines(bufnr, at, at, false, { "# @name " .. name })
+      end
+    end)
+  end,
+  ["gooseman.expect"] = function(uri, row)
+    local b, bufnr, lines = block_for(uri, row)
+    local resp = g.last[g.last_key(vim.uri_to_fname(uri), b)]
+    if not resp then
+      return
+    end
+    local want = {}
+    if not b.req.text:match "^GRPC" then
+      want[#want + 1] = "status == " .. resp.status
+    end
+    if (resp.headers["content-type"] or ""):find "json" then
+      want[#want + 1] = "headers.content-type contains json"
+    end
+    if type(resp.body) == "table" then
+      local keys = vim.islist(resp.body) and (#resp.body > 0 and { "0" } or {}) or vim.tbl_keys(resp.body)
+      table.sort(keys)
+      for i = 1, math.min(#keys, 5) do
+        if keys[i]:match "^[%w_%-]+$" then
+          want[#want + 1] = "body." .. keys[i] .. " exists"
+        end
+      end
+    end
+    local have, add = {}, {}
+    for _, e in ipairs(b.expects) do
+      have[e.text] = true
+    end
+    for _, w in ipairs(want) do
+      if not have[w] then
+        add[#add + 1] = "# @expect " .. w
+      end
+    end
+    local at = b.name_line or b.sep or (b.first - 1)
+    vim.api.nvim_buf_set_lines(bufnr, at, at, false, add)
+  end,
+  ["gooseman.grpc_template"] = function(uri, row)
+    local b, bufnr, _, s = block_for(uri, row)
+    local url, method = b.req.text:match "^GRPC%s+(%S+)%s+(%S+)"
+    local resolved = url and resolve_plain(url, s)
+    if not resolved then
+      return vim.notify("gooseman: can't resolve " .. tostring(url) .. " without sending", vim.log.levels.WARN)
+    end
+    local tmpl, err = grpc.template(resolved, method)
+    if not tmpl then
+      return vim.notify("gooseman: " .. err, vim.log.levels.WARN)
+    end
+    local at = #b.headers > 0 and b.headers[#b.headers].line or b.req.line
+    vim.api.nvim_buf_set_lines(bufnr, at, at, false, vim.list_extend({ "" }, vim.split(tmpl, "\n")))
+  end,
+  ["gooseman.extract"] = function(uri, row, s_col, e_col)
+    local lines, bufnr = buf_lines(uri)
+    local text = lines[row]:sub(s_col + 1, e_col)
+    local guess = text:match "^https?://" and "host" or text:match "^grpcs?://" and "grpc" or "value"
+    vim.ui.input({ prompt = ("@var for %q: "):format(text), default = guess }, function(name)
+      if not (name and name:match "^[%w_%-]+$") then
+        return
+      end
+      local at, first_sep = 0, nil
+      for i, l in ipairs(lines) do
+        first_sep = first_sep or (l:match "^###" and i)
+        if not first_sep and l:match "^@" then
+          at = i -- after the last @var of the preamble
+        end
+        -- only request/header/body text, and never inside an existing {{ref}}
+        if not (l:match "^@" or l:match "^###" or l:match "^%s*#" or l:match "^%s*//") then
+          local out, pos = {}, 1
+          for _, r in ipairs(vim.list_extend(g.refs(l), { { s = #l + 1, e = #l } })) do
+            out[#out + 1] = l:sub(pos, r.s - 1):gsub(vim.pesc(text), "{{" .. name .. "}}")
+            out[#out + 1] = l:sub(r.s, r.e)
+            pos = r.e + 1
+          end
+          lines[i] = table.concat(out)
+        end
+      end
+      table.insert(lines, at + 1, ("@%s = %s"):format(name, text))
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+    end)
+  end,
+}
+
+local function code_actions(params)
+  local uri, rng = params.textDocument.uri, params.range
+  local row = rng.start.line + 1
+  local b, _, lines = block_for(uri, row)
+  local acts = {}
+  local function act(title, command, ...)
+    acts[#acts + 1] = { title = title, command = { title = title, command = command, arguments = { uri, row, ... } } }
+  end
+  if b and b.req then
+    act("Honk: send this request", "gooseman.send")
+    act("Honk: copy as curl", "gooseman.curl")
+    if not b.name then
+      act("Honk: name this request", "gooseman.name")
+    end
+    if g.last[g.last_key(vim.uri_to_fname(uri), b)] then
+      act("Honk: add @expect from the last response", "gooseman.expect")
+    end
+    if b.req.text:match "^GRPC%s+%S+%s+%S+/%S+" and #b.body == 0 then
+      act("Honk: insert gRPC request template", "gooseman.grpc_template")
+    end
+  end
+  if rng.start.line == rng["end"].line and rng["end"].character > rng.start.character then
+    local text = (lines[row] or ""):sub(rng.start.character + 1, rng["end"].character)
+    if vim.trim(text) ~= "" and not text:find "{{" and not text:find "}}" then
+      act("Honk: extract to @var", "gooseman.extract", rng.start.character, rng["end"].character)
+    end
+  end
+  return acts
+end
+
 local handlers = {
   initialize = function()
     return {
@@ -327,6 +549,8 @@ local handlers = {
         completionProvider = { triggerCharacters = { "{", ".", "@", ":" } },
         hoverProvider = true,
         definitionProvider = true,
+        codeActionProvider = true,
+        executeCommandProvider = { commands = vim.tbl_keys(COMMANDS) },
       },
       serverInfo = { name = "gooseman" },
     }
@@ -335,6 +559,13 @@ local handlers = {
   ["textDocument/completion"] = complete,
   ["textDocument/hover"] = hover,
   ["textDocument/definition"] = definition,
+  ["textDocument/codeAction"] = code_actions,
+  ["workspace/executeCommand"] = function(params)
+    local f = COMMANDS[params.command]
+    if f then
+      f(unpack(params.arguments or {}))
+    end
+  end,
 }
 
 local refreshers = {} -- one per running server: re-publish diagnostics for its open docs

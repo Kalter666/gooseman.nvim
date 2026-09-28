@@ -163,4 +163,28 @@ env.active = nil
 r = assert(p.parse(lines, 2, path))
 assert(r.url == "http://h/shared/file/{{c}}/{{secret}}", r.url)
 vim.fn.delete(dir, "rf")
+
+-- token expiry: JWT exp and OAuth expires_in; an expired cached login is dropped, not reused
+local function jwt(claims)
+  local b64 = function(t) return (vim.base64.encode(vim.json.encode(t)):gsub("=", ""):gsub("+", "-"):gsub("/", "_")) end
+  return b64 { alg = "HS256" } .. "." .. b64(claims) .. ".sig"
+end
+local now = os.time()
+assert(p.expires_at { body = { token = jwt { exp = now + 100 } } } == now + 100)
+assert(p.expires_at { body = { access_token = "opaque", expires_in = 60 }, at = now } == now + 60)
+assert(p.expires_at { body = { token = jwt { exp = now + 500 }, expires_in = 60 }, at = now } == now + 60)
+assert(p.expires_at { body = { token = "a.b.c" } } == nil)
+assert(p.expires_at { body = { token = jwt { sub = "x" } } } == nil)
+p.responses = { login = { status = 200, headers = {}, body = { token = jwt { exp = now + 5 } }, at = now } }
+local ok2, err2 = pcall(p.parse, { "GET http://h/{{login.body.token}}" }, 1)
+assert(not ok2 and err2:find "has not been sent yet", tostring(err2)) -- 5s left < skew: treated as gone
+assert(p.responses.login == nil, "expired login must be dropped")
+p.responses.login = { status = 200, headers = {}, body = { token = jwt { exp = now + 3600 } }, at = now }
+assert(p.parse({ "GET http://h/{{login.body.token}}" }, 1).url:find "^http://h/ey")
+
+-- snippets all parse as LSP snippets
+local G = require "vim.lsp._snippet_grammar"
+for _, sn in ipairs(require("gooseman.snippets").list) do
+  assert(pcall(G.parse, require("gooseman.snippets").lsp_body(sn.body)), sn.prefix)
+end
 print "ok"
